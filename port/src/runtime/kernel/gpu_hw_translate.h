@@ -31,6 +31,7 @@ struct PsTranslation
     uint32_t cubeSlots = 0;      // of those, slots fetched as cubes (bound as Texture2DArray)
     uint32_t constantRows = 0; // prefix of c[] read; dynamic indexing needs the full bank
     bool writesDepth = false;    // exports oDepth (export 61, X): the function sets eDepth / wroteDepth
+    bool usesKill = false;       // has a kill (V_KILL_* / S_KILLS_*): only then can XOut.killed be true
     std::string unsupported;     // non-empty: the shader cannot be translated
 };
 
@@ -231,6 +232,7 @@ public:
     uint32_t lastSlot = ~0u, lastStride = 0;   // vfetch_mini state, in program order (as RunShader)
     bool r0IndexWritten = false;      // r0.x may no longer hold the original vertex index
     bool depthExport = false;         // pixel shader writes oDepth (export 61)
+    bool usesKill = false;            // a kill instruction was emitted (it may set killed)
 
     std::string R(uint32_t i)
     {
@@ -399,6 +401,7 @@ public:
         case V_KILL_EQ: case V_KILL_GT: case V_KILL_GE: case V_KILL_NE:
         {
             const char* cmp = vop == V_KILL_EQ ? "==" : vop == V_KILL_GT ? ">" : vop == V_KILL_GE ? ">=" : "!=";
+            usesKill = true;
             out << "        bool k = any(va " << cmp << " vb);\n        if (k) killed = true;\n";
             res = "(k ? 1.0 : 0.0).xxxx";
             break;
@@ -503,6 +506,7 @@ public:
                     const char* k = sop == S_KILLS_EQ ? "s0 == 0.0" : sop == S_KILLS_GT ? "s0 > 0.0"
                                   : sop == S_KILLS_GE ? "s0 >= 0.0" : sop == S_KILLS_NE ? "s0 != 0.0"
                                   : "s0 == 1.0";
+                    usesKill = true;
                     out << "        bool ks = " << k << ";\n        if (ks) killed = true;\n";
                     sr = "ks ? 1.0 : 0.0";
                     break;
@@ -850,6 +854,7 @@ inline PsTranslation TranslatePixelShader(const std::vector<uint32_t>& code, boo
     result.textureSlots = w.textures;
     result.cubeSlots = w.cubeSlots;
     result.writesDepth = w.depthExport;
+    result.usesKill = w.usesKill;
     result.constantRows = w.constantRows;
     return result;
 }
@@ -878,7 +883,11 @@ inline bool HasTextureStateVariants(const PsTranslation& t)
 // Complete pixel shader: translated body + kill + alpha test (RB_COLORCONTROL semantics). A
 // depth-exporting shader also outputs SV_Depth: the exported X clamped to 0..1 like Xenia (host
 // depth holds the guest's window z), or the rasterized depth on paths that never export it.
-inline std::string PixelShaderHlsl(const PsTranslation& t, TextureStateVariant variant)
+// alphaTest false: the variant for draws whose alpha test is off (or ALWAYS). It leaves the alpha
+// block out, and the kill discard too when the shader has no kill, so a shader without kills has
+// no discard at all and a tile-based GPU keeps early depth / hidden-surface removal for it. The
+// default (alpha-test capable) text is unchanged, and so are its disk-cache keys.
+inline std::string PixelShaderHlsl(const PsTranslation& t, TextureStateVariant variant, bool alphaTest = true)
 {
     std::string function = t.function;
     if (variant != TextureStateVariant::Generic && HasTextureStateVariants(t))
@@ -906,12 +915,14 @@ inline std::string PixelShaderHlsl(const PsTranslation& t, TextureStateVariant v
             }
         }
     }
-    return std::string(PsPrelude()) + function + R"(
+    std::string hlsl = std::string(PsPrelude()) + function + R"(
 struct PSIn { float4 pos : SV_Position; float4 a[16] : TEXCOORD0; };
 )" + (t.writesDepth ? "float4 main(PSIn input, out float oDepth : SV_Depth) : SV_Target" : "float4 main(PSIn input) : SV_Target") + R"(
 {
-    XOut o = XenosPs(input.a);)" + (t.writesDepth ? "\n    oDepth = wroteDepth ? saturate(eDepth.x) : input.pos.z;" : "") + R"(
-    if (o.killed) discard;
+    XOut o = XenosPs(input.a);)" + (t.writesDepth ? "\n    oDepth = wroteDepth ? saturate(eDepth.x) : input.pos.z;" : "");
+    if (alphaTest || t.usesKill) hlsl += R"(
+    if (o.killed) discard;)";
+    if (alphaTest) hlsl += R"(
     if (alphaTest != 0)
     {
         float a = o.color.a; bool ok;            // ("pass" is reserved in HLSL)
@@ -923,10 +934,17 @@ struct PSIn { float4 pos : SV_Position; float4 a[16] : TEXCOORD0; };
         case 6: ok = a >= alphaRef; break;     default: ok = true; break;
         }
         if (!ok) discard;
-    }
+    })";
+    return hlsl + R"(
     return o.color;
 }
 )";
+}
+// Worth a no-alpha-test variant: no kill (so that variant has no discard) and no depth export
+// (a shader writing SV_Depth loses early depth anyway).
+inline bool HasNoDiscardVariant(const PsTranslation& t)
+{
+    return !t.usesKill && !t.writesDepth && t.unsupported.empty();
 }
 
 inline std::string PixelShaderHlsl(const PsTranslation& t, bool staticDepth = false)

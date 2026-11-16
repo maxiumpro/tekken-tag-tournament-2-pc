@@ -725,6 +725,15 @@ public:
         if ((staticDepth || staticResolvedColor) && lastPsEntry_)
             ps = TextureStatePixelShader(psCode, lastPsKey_, *lastPsEntry_,
                 staticDepth ? TextureStateVariant::Depth : TextureStateVariant::ResolvedColor);
+        // No alpha test (or ALWAYS, alphaFunc 7) and no kill: the shader without discard
+        // (NoDiscardPixelShader). Alpha-tested draws always keep the alpha-test capable shader.
+        if (lastPsEntry_ && lastPsEntry_->noDiscard && (!st.alphaTest || st.alphaFunc == 7) && NoDiscardOpt())
+        {
+            const auto variant = staticDepth ? TextureStateVariant::Depth
+                               : staticResolvedColor ? TextureStateVariant::ResolvedColor : TextureStateVariant::Generic;
+            if (ID3D11PixelShader* noDiscard = NoDiscardPixelShader(psCode, lastPsKey_, *lastPsEntry_, variant))
+                ps = noDiscard;
+        }
         if (std::memcmp(&cb, &lastState_, sizeof(cb)) != 0 || !stateValid_)
         {
             lastState_ = cb; stateValid_ = true;
@@ -2736,8 +2745,11 @@ private:
     struct PsEntry {
         ComPtr<ID3D11PixelShader> ps;
         ComPtr<ID3D11PixelShader> textureStatePs[2]; // depth, resolved color
+        // Without the alpha test, by TextureStateVariant (generic, depth, resolved color).
+        ComPtr<ID3D11PixelShader> noDiscardPs[3];
         uint32_t slots = 0, cubeSlots = 0, constantRows = 0;
-        bool failed = false, textureStateFailed[2] = {};
+        bool failed = false, textureStateFailed[2] = {}, noDiscardFailed[3] = {};
+        bool noDiscard = false;                      // HasNoDiscardVariant
     };
     PsEntry* lastPsEntry_ = nullptr;
     uint64_t lastPsKey_ = 0;
@@ -2961,6 +2973,35 @@ private:
         entry.textureStatePs[index] = std::move(b.entry.ps);
         return entry.textureStatePs[index].Get();
     }
+    // A draw with no alpha test (or ALWAYS) of a shader without kills: the variant with no discard,
+    // so a tile-based GPU (Metal through DXVK and MoltenVK) keeps early depth / hidden-surface
+    // removal. Null while it builds or if it failed: the caller keeps its alpha-test capable shader,
+    // which draws the same with the test off. Each variant has its own pending map, so a build of
+    // one is never handed to a draw that wants another. TTT2_PS_NO_DISCARD_OPT=0 turns this off.
+    std::unordered_map<uint64_t, std::future<Built<PsEntry>>> pendingNoDiscardPs_[3];
+    static bool NoDiscardOpt()
+    {
+        static const bool on = [] { const char* e = std::getenv("TTT2_PS_NO_DISCARD_OPT"); return !e || std::strcmp(e, "0") != 0; }();
+        return on;
+    }
+    ID3D11PixelShader* NoDiscardPixelShader(const std::vector<uint32_t>& code, uint64_t key,
+                                            PsEntry& entry, TextureStateVariant variant)
+    {
+        const unsigned index = static_cast<unsigned>(variant);
+        if (entry.noDiscardPs[index]) return entry.noDiscardPs[index].Get();
+        if (entry.noDiscardFailed[index]) return nullptr;
+        Built<PsEntry> b;
+        if (!AwaitBuild(pendingNoDiscardPs_[index], key, b, [this, code, variant] {
+                Built<PsEntry> r;
+                r.result = BuildPixelShader(code, r.entry, r.counts, r.why, false, false, variant, false);
+                return r;
+            }, false)) return nullptr;
+        stats_.diskHits += b.counts.diskHits; stats_.compiles += b.counts.compiles;
+        entry.noDiscardFailed[index] = b.result != BuildResult::Ready;
+        if (entry.noDiscardFailed[index]) return nullptr;
+        entry.noDiscardPs[index] = std::move(b.entry.ps);
+        return entry.noDiscardPs[index].Get();
+    }
 #if defined(__ANDROID__)
     // New fight shaders arrive in bursts. A bounded pool limits CPU use
     // while the game and audio threads continue running.
@@ -3088,12 +3129,14 @@ private:
     }
     BuildResult BuildPixelShader(const std::vector<uint32_t>& code, PsEntry& e, BuildCounts& n, std::string& why,
                                  bool inGame = false, bool cacheOnly = false,
-                                 TextureStateVariant variant = TextureStateVariant::Generic) const
+                                 TextureStateVariant variant = TextureStateVariant::Generic, bool alphaTest = true) const
     {
         const PsTranslation t = TranslatePixelShader(code);
         if (!t.unsupported.empty()) { why = t.unsupported; return BuildResult::Untranslatable; }
         e.slots = t.textureSlots; e.cubeSlots = t.cubeSlots; e.constantRows = t.constantRows;
-        return CreateFromHlsl(PixelShaderHlsl(t, variant), false, inGame, n, why,
+        e.noDiscard = HasNoDiscardVariant(t);
+        if (!alphaTest && !e.noDiscard) { why = "no no-discard variant"; return BuildResult::Untranslatable; }
+        return CreateFromHlsl(PixelShaderHlsl(t, variant, alphaTest), false, inGame, n, why,
                               [&](const void* p, size_t size) { return device_->CreatePixelShader(p, size, nullptr, &e.ps); }, cacheOnly);
     }
 
@@ -3490,6 +3533,14 @@ private:
                                     if (BuildPixelShader(code, specialized, n, why, false, true, variant) == BuildResult::Ready)
                                         e.textureStatePs[index] = std::move(specialized.ps);
                                 }
+                            }
+                            // Cached no-discard variants: the generic one, and those of the texture-state variants loaded above.
+                            for (unsigned index = 0; e.noDiscard && NoDiscardOpt() && index < 3; ++index)
+                            {
+                                if (index && !e.textureStatePs[index - 1]) continue;
+                                PsEntry noDiscard;
+                                if (BuildPixelShader(code, noDiscard, n, why, false, true, static_cast<TextureStateVariant>(index), false) == BuildResult::Ready)
+                                    e.noDiscardPs[index] = std::move(noDiscard.ps);
                             }
                             std::lock_guard lock(preparedMutex_);
                             preparedPs_.emplace(PsKey(code), std::move(e));
