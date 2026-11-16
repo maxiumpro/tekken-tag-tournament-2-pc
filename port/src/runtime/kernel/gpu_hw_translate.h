@@ -574,6 +574,10 @@ public:
             out << "        float4 f = " << t << op << (slot & 15) << "], XNativeUV(uv, smp, texScale["
                 << slot << "])" << tail;
         out << "        f = XSwz(XRemap(f, texInfo[" << slot << "].y), texInfo[" << slot << "].x);\n";
+        // TTT2_PS_FAKE_TEX=1 (diagnostics, R1d): overwrite the fetch with a constant so the shader compiler drops
+        // the sample, its derivatives and the per-fetch uniform logic; the ALU work after the fetch stays.
+        static const bool fakeTex = [] { const char* e = std::getenv("TTT2_PS_FAKE_TEX"); return e && *e == '1'; }();
+        if (fakeTex) out << "        f = float4(0.5, 0.5, 0.5, 1.0);\n";
         const std::string dst = R(in.dstRegister());
         const uint32_t dsw = in.dstSwizzle();
         for (int i = 0; i < 4; ++i)
