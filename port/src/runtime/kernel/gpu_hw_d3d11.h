@@ -694,6 +694,10 @@ public:
         ID3D11SamplerState* samplers[16] = {};
         bool staticDepth = textureSlots != 0 && lastCubeSlots_ == 0;
         bool staticResolvedColor = staticDepth;
+        const int texSpecMode = TexSpecMode();
+        const bool texSpecOn = texSpecMode != 0 && textureSlots != 0 && lastPsEntry_;
+        PsTexSpec spec;
+        spec.implicitLod = texSpecMode == 2;
         for (uint32_t slot = 0; slot < 32; ++slot)
         {
             if (!(textureSlots & (1u << slot))) continue;
@@ -721,14 +725,29 @@ public:
                 cb.texScale[slot][0], cb.texScale[slot][1], cb.texSampler[slot]);
             staticResolvedColor = staticResolvedColor && StaticResolvedColorTextureState(ft.format,
                 cb.texInfo[slot][0], cb.texInfo[slot][1], cb.texSampler[slot]);
-            samplers[slot & 15] = Sampler(cb.texSampler[slot], MipSampling(ft, b.levels));
+            const uint32_t mip = MipSampling(ft, b.levels);
+            samplers[slot & 15] = Sampler(cb.texSampler[slot], mip);
+            if (texSpecOn)
+            {
+                // LOD-free: the sampler clamps to level 0 (SamplerDesc: MinLOD = MaxLOD = 0, so no
+                // anisotropy either) and magnifies with the filter it minifies with.
+                const bool lodFree = ((mip >> 10) & 0xF) == 0 && ((mip & 1) != 0) == (cb.texSampler[slot][2] != 0);
+                spec.slots |= 1u << slot;
+                spec.word[slot] = PsTexSpecWord(((lastCubeSlots_ >> slot) & 1) != 0, cb.texInfo[slot], cb.texScale[slot],
+                                                cb.texSampler[slot], lodFree);
+            }
         }
-        if ((staticDepth || staticResolvedColor) && lastPsEntry_)
+        // No alpha test (or ALWAYS, alphaFunc 7) and no kill: the shader without discard.
+        const bool noDiscardDraw = lastPsEntry_ && lastPsEntry_->noDiscard && (!st.alphaTest || st.alphaFunc == 7) && NoDiscardOpt();
+        // The draw's texture state compiled in (TexSpecPixelShader); until it is built, the shaders below.
+        ID3D11PixelShader* specialized = texSpecOn ? TexSpecPixelShader(psCode, lastPsKey_, *lastPsEntry_, spec, !noDiscardDraw) : nullptr;
+        if (specialized) ps = specialized;
+        if (!specialized && (staticDepth || staticResolvedColor) && lastPsEntry_)
             ps = TextureStatePixelShader(psCode, lastPsKey_, *lastPsEntry_,
                 staticDepth ? TextureStateVariant::Depth : TextureStateVariant::ResolvedColor);
         // No alpha test (or ALWAYS, alphaFunc 7) and no kill: the shader without discard
         // (NoDiscardPixelShader). Alpha-tested draws always keep the alpha-test capable shader.
-        if (lastPsEntry_ && lastPsEntry_->noDiscard && (!st.alphaTest || st.alphaFunc == 7) && NoDiscardOpt())
+        if (!specialized && noDiscardDraw)
         {
             const auto variant = staticDepth ? TextureStateVariant::Depth
                                : staticResolvedColor ? TextureStateVariant::ResolvedColor : TextureStateVariant::Generic;
@@ -2791,6 +2810,10 @@ private:
         uint32_t slots = 0, cubeSlots = 0, constantRows = 0;
         bool failed = false, textureStateFailed[2] = {}, noDiscardFailed[3] = {};
         bool noDiscard = false;                      // HasNoDiscardVariant
+        // Texture-state variants (TexSpecPixelShader), by TexSpecKey: null while building or if it failed.
+        struct TexSpec { ComPtr<ID3D11PixelShader> ps; bool pending = false; };
+        std::unordered_map<uint64_t, TexSpec> texSpec;
+        bool texSpecCapped = false;                  // the per-shader cap was hit (logged once)
     };
     PsEntry* lastPsEntry_ = nullptr;
     uint64_t lastPsKey_ = 0;
@@ -3043,6 +3066,101 @@ private:
         entry.noDiscardPs[index] = std::move(b.entry.ps);
         return entry.noDiscardPs[index].Get();
     }
+    // The draw's texture state compiled into the pixel shader (PsTexSpec, TranslatePixelShader): no
+    // per-fetch swizzle / remap / address-mode / cube logic on uniforms, and SampleLevel 0 for LOD-free
+    // samplers. One variant per canonical state and alpha-test flavour; null while it builds (in the
+    // background, its bytecode cached by HLSL text like every shader), if it failed, or past the caps:
+    // the caller keeps today's shaders. TTT2_PS_TEXSTATE_SPECIALIZE=0 turns it off, =2 also uses Sample
+    // for derivative-sampled fetches without an in-shader wrap (not bit-exact: an A/B option);
+    // TTT2_PS_TEXSTATE_MAX: variants per shader (8). At most 2 build at once, so a cold cache does not
+    // start hundreds of optimised compiles together.
+    static int TexSpecMode()
+    {
+        static const int mode = [] {
+            const char* e = std::getenv("TTT2_PS_TEXSTATE_SPECIALIZE");
+            const int m = e && *e ? std::clamp(std::atoi(e), 0, 2) : 1;
+            std::fprintf(stderr, "[gpu-hw] texture-state pixel-shader variants: %s\n",
+                         m == 0 ? "off" : m == 1 ? "on" : "on, implicit-LOD Sample (A/B, not bit-exact)");
+            return m;
+        }();
+        return mode;
+    }
+    static uint64_t TexSpecKey(const PsTexSpec& spec, bool alphaTest)
+    {
+        uint64_t h = Fnv(&spec.slots, sizeof(spec.slots), 0x7E55ull + (alphaTest ? 1 : 0) + (spec.implicitLod ? 2 : 0));
+        for (uint32_t slot = 0; slot < 32; ++slot)
+            if ((spec.slots >> slot) & 1) h = Fnv(&spec.word[slot], sizeof(spec.word[slot]), h);
+        return h;
+    }
+    struct TexSpecBuild { uint64_t base, key; std::future<Built<PsEntry>> result; };
+    std::vector<TexSpecBuild> texSpecBuilds_;            // in flight, at most kTexSpecInFlight
+    static constexpr size_t kTexSpecInFlight = 2;
+    uint64_t texSpecReady_ = 0, texSpecFailed_ = 0, texSpecDiskHits_ = 0;
+    ID3D11PixelShader* TexSpecPixelShader(const std::vector<uint32_t>& code, uint64_t base, PsEntry& entry,
+                                          const PsTexSpec& spec, bool alphaTest)
+    {
+        static const size_t cap = [] { const char* e = std::getenv("TTT2_PS_TEXSTATE_MAX"); return size_t(e && *e ? std::clamp(std::atoi(e), 1, 256) : 8); }();
+        static const bool async = [] { const char* e = std::getenv("TTT2_SHADER_ASYNC"); return !e || std::strcmp(e, "0") != 0; }();
+        const uint64_t key = TexSpecKey(spec, alphaTest);
+        auto it = entry.texSpec.find(key);
+        if (it != entry.texSpec.end())
+        {
+            if (it->second.pending) HarvestTexSpec();
+            return it->second.ps.Get();
+        }
+        if (entry.texSpec.size() >= cap)
+        {
+            if (!entry.texSpecCapped)
+            {
+                entry.texSpecCapped = true;
+                std::fprintf(stderr, "[gpu-hw] pixel shader %016llX: %zu texture-state variants (the cap, TTT2_PS_TEXSTATE_MAX); "
+                             "further states draw with the generic shader\n", (unsigned long long)base, cap);
+            }
+            return nullptr;
+        }
+        if (texSpecBuilds_.size() >= kTexSpecInFlight) HarvestTexSpec();
+        if (texSpecBuilds_.size() >= kTexSpecInFlight) return nullptr;   // asked again by a later draw
+        auto build = [this, code, spec, alphaTest] {
+            Built<PsEntry> r;
+            r.result = BuildPixelShader(code, r.entry, r.counts, r.why, false, false, TextureStateVariant::Generic, alphaTest, &spec);
+            return r;
+        };
+        auto& variant = entry.texSpec[key];
+        variant.pending = true;
+#if defined(__ANDROID__)
+        texSpecBuilds_.push_back({ base, key, BuildQueue().Submit(std::move(build)) });
+#else
+        texSpecBuilds_.push_back({ base, key, std::async(std::launch::async, std::move(build)) });
+#endif
+        if (!async) { texSpecBuilds_.back().result.wait(); HarvestTexSpec(); }
+        return variant.ps.Get();
+    }
+    // Adopt every finished texture-state build into its shader's entry.
+    void HarvestTexSpec()
+    {
+        for (size_t i = 0; i < texSpecBuilds_.size();)
+        {
+            TexSpecBuild& b = texSpecBuilds_[i];
+            if (b.result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++i; continue; }
+            Built<PsEntry> r = b.result.get();
+            stats_.diskHits += r.counts.diskHits; stats_.compiles += r.counts.compiles;
+            texSpecDiskHits_ += r.counts.diskHits;
+            if (auto e = pixelShaders_.find(b.base); e != pixelShaders_.end())
+                if (auto v = e->second.texSpec.find(b.key); v != e->second.texSpec.end())
+                {
+                    v->second.pending = false;
+                    if (r.result == BuildResult::Ready) v->second.ps = std::move(r.entry.ps);
+                }
+            if (r.result == BuildResult::Ready) ++texSpecReady_;
+            else if (texSpecFailed_++ < 16)
+                std::fprintf(stderr, "[gpu-hw] pixel shader %016llX: texture-state variant failed (generic shader kept): %s\n",
+                             (unsigned long long)b.base, r.why.c_str());
+            if (r.result == BuildResult::Ready && (texSpecReady_ & (texSpecReady_ - 1)) == 0)
+                std::fprintf(stderr, "[gpu-hw] texture-state variants: %llu ready (%llu from the bytecode cache so far this run)\n",
+                             (unsigned long long)texSpecReady_, (unsigned long long)texSpecDiskHits_);
+            texSpecBuilds_.erase(texSpecBuilds_.begin() + ptrdiff_t(i));
+        }
+    }
 #if defined(__ANDROID__)
     // New fight shaders arrive in bursts. A bounded pool limits CPU use
     // while the game and audio threads continue running.
@@ -3170,9 +3288,10 @@ private:
     }
     BuildResult BuildPixelShader(const std::vector<uint32_t>& code, PsEntry& e, BuildCounts& n, std::string& why,
                                  bool inGame = false, bool cacheOnly = false,
-                                 TextureStateVariant variant = TextureStateVariant::Generic, bool alphaTest = true) const
+                                 TextureStateVariant variant = TextureStateVariant::Generic, bool alphaTest = true,
+                                 const PsTexSpec* spec = nullptr) const
     {
-        const PsTranslation t = TranslatePixelShader(code);
+        const PsTranslation t = TranslatePixelShader(code, false, spec);
         if (!t.unsupported.empty()) { why = t.unsupported; return BuildResult::Untranslatable; }
         e.slots = t.textureSlots; e.cubeSlots = t.cubeSlots; e.constantRows = t.constantRows;
         e.noDiscard = HasNoDiscardVariant(t);

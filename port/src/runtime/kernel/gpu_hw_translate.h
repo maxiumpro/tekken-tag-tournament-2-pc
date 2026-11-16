@@ -35,6 +35,48 @@ struct PsTranslation
     std::string unsupported;     // non-empty: the shader cannot be translated
 };
 
+// Per-draw texture state baked into a pixel-shader variant (TTT2_PS_TEXSTATE_SPECIALIZE, gpu_hw_d3d11.h).
+// One canonical word per sampled slot (PsTexSpecWord), holding only what changes a fetch's code, so two
+// draws whose state differs where the code does not read it share one variant:
+//   bits 0-11  the fetch result after XRemap + XSwz: 3 bits per component, 0-3 = texel x/y/z/w, 4 = 0, 5 = 1
+//   bits 12-13 / 14-15  XNativeUV on u / v: 0 none, 1 mirror once (min(abs)), 2 wrap (frac), 3 mirror (XWrap1 1)
+//   bit 16     a cube fetch with a cube texture bound (texScale.z > 1.5)
+//   bit 17     the slot's sampler reads level 0 only with one filter for magnify and minify: LOD-free
+// The scale multiply and the denormalised-coordinate divide stay per draw (texScale.xy, texInfo.zw).
+// implicitLod (opt-in, not bit-exact): Sample instead of SampleGrad where the sampled coordinate is the
+// derivative's own expression.
+struct PsTexSpec
+{
+    uint32_t slots = 0;
+    uint32_t word[32] = {};
+    bool implicitLod = false;
+};
+inline uint32_t PsTexSpecWord(bool cubeFetch, const uint32_t info[4], const float scale[4], const uint32_t sampler[4], bool lodFree)
+{
+    // XRemap (by mode), then XSwz (selectors 6/7 keep the remapped component).
+    static const uint32_t remap[4][4] = { { 0, 1, 2, 3 }, { 0, 0, 0, 5 }, { 2, 1, 0, 3 }, { 0, 0, 0, 0 } };
+    const uint32_t* g = remap[info[1] >= 1 && info[1] <= 3 ? info[1] : 0];
+    uint32_t word = 0;
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        const uint32_t s = (info[0] >> (3 * i)) & 7;
+        const uint32_t c = s < 4 ? g[s] : s == 4 ? 4 : s == 5 ? 5 : g[i];
+        word |= c << (3 * i);
+    }
+    const bool cube = cubeFetch && scale[2] > 1.5f;
+    auto axis = [&](uint32_t mode, float s) -> uint32_t {
+        if (cube) return 0;                                   // the shader clamps cube faces (smp = 2, 2)
+        if (mode == 3 || mode == 5 || mode == 7) return 1;
+        if (s != 1.0f) return mode == 0 ? 2 : mode == 1 ? 3 : 0;
+        return 0;
+    };
+    word |= axis(sampler[0], scale[0]) << 12;
+    word |= axis(sampler[1], scale[1]) << 14;
+    if (cube) word |= 1u << 16;
+    if (lodFree) word |= 1u << 17;
+    return word;
+}
+
 // Shared declarations for every translated pixel shader. Register map:
 //   b0 = 256 pixel ALU constants (register file entries 256..511)
 //   b1 = per-draw state (bool + loop constants, texture remap/swizzle/scale, alpha test)
@@ -221,6 +263,7 @@ public:
     uint32_t textures = 0, cubeSlots = 0, flatSlots = 0;
     std::string unsupported;
     bool exactFilter = false;
+    const PsTexSpec* spec = nullptr;  // pixel shaders: per-draw texture state to bake in (null: generic)
     int samplerOwner[16] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
     bool arrayRegs = false;           // relative addressing present: registers are r[64]
     // Vertex shaders: exports go to oPos (62) / oI[0..15], all 512 ALU constants are
@@ -532,9 +575,18 @@ public:
         if (cubeSlots & flatSlots) unsupported = "slot " + Num(slot) + " fetched both as 2D and as a cube";
         const std::string src = R(in.srcRegister()), t = "tex" + Num(slot);
         const uint32_t sw = in.srcSwizzle();
+        // Sampler register slot & 15: two used slots sharing one would need two samplers.
+        if (samplerOwner[slot & 15] >= 0 && samplerOwner[slot & 15] != int(slot))
+            unsupported = "sampler register collision (slots " + Num(samplerOwner[slot & 15]) + "/" + Num(slot) + ")";
+        samplerOwner[slot & 15] = int(slot);
         out << "    {\n";
         out << "        float2 uv = float2(" << src << "." << "xyzw"[sw & 3] << ", "
             << src << "." << "xyzw"[(sw >> 2) & 3] << ");\n";
+        if (spec && !exactFilter && !vertex && ((spec->slots >> slot) & 1))
+        {
+            SpecializedFetch(in, slot, spec->word[slot], src, t);
+            return;
+        }
         if (cube)
         {
             // As ExecTextureFetch: cube semantics only when a cube texture is bound (6 slices).
@@ -544,10 +596,6 @@ public:
             if (in.coordDenorm()) out << "        else uv /= float2(texInfo[" << slot << "].zw);\n";
         }
         else if (in.coordDenorm()) out << "        uv /= float2(texInfo[" << slot << "].zw);\n";
-        // Sampler register slot & 15: two used slots sharing one would need two samplers.
-        if (samplerOwner[slot & 15] >= 0 && samplerOwner[slot & 15] != int(slot))
-            unsupported = "sampler register collision (slots " + Num(samplerOwner[slot & 15]) + "/" + Num(slot) + ")";
-        samplerOwner[slot & 15] = int(slot);
         out << "        uint4 smp = texSampler[" << slot << "];\n";
         // Filter 3 (every TTT2 tfetch) defers to the fetch constant; an explicit override
         // is honoured exactly in the parity path, approximated by the slot sampler otherwise.
@@ -574,6 +622,73 @@ public:
             out << "        float4 f = " << t << op << (slot & 15) << "], XNativeUV(uv, smp, texScale["
                 << slot << "])" << tail;
         out << "        f = XSwz(XRemap(f, texInfo[" << slot << "].y), texInfo[" << slot << "].x);\n";
+        FetchTail(in);
+    }
+
+    // A tfetch with its slot's draw state compiled in (PsTexSpec). Each step is the generic fetch's code
+    // with the per-draw values replaced by what they select, so the result is the same:
+    // - the remap + swizzle become one constructor of texel components and 0 / 1 (copies, no arithmetic);
+    // - the cube test becomes the bound texture's answer, and XNativeUV only the operations its sampler
+    //   modes and scale select (the same expressions; texScale.xy and texInfo.zw stay per draw);
+    // - an LOD-free sampler (one level, magnify filter = minify filter, so no anisotropy) samples level 0
+    //   whatever the derivatives: SampleLevel 0 instead of SampleGrad, and no ddx / ddy;
+    // - implicitLod (opt-in): Sample instead of SampleGrad when no wrap or mirror is applied in the shader,
+    //   so the sampled coordinate is the derivative's own expression. Not bit-exact: HLSL ddx is the coarse
+    //   derivative, Sample's implicit one is the driver's choice (and its LOD arithmetic may differ).
+    void SpecializedFetch(const TFetch& in, uint32_t slot, uint32_t word, const std::string& src, const std::string& t)
+    {
+        const bool cubeFetch = in.dimension() == 3, cube = cubeFetch && ((word >> 16) & 1);
+        const uint32_t sw = in.srcSwizzle();
+        if (cube)
+            out << "        uv -= 1.0; int face = clamp(XFloor(" << src << "." << "xyzw"[(sw >> 4) & 3] << " + 0.5), 0, 5);\n";
+        else if (in.coordDenorm()) out << "        uv /= float2(texInfo[" << slot << "].zw);\n";
+        const uint32_t axes[2] = { (word >> 12) & 3, (word >> 14) & 3 };
+        std::string coord = "uv";
+        if (axes[0] || axes[1])
+        {
+            out << "        float2 nuv = uv;\n";
+            coord = "nuv";
+            for (int a = 0; a < 2; ++a)
+            {
+                const std::string c = std::string("nuv.") + "xy"[a];
+                if (axes[a] == 1) out << "        " << c << " = min(abs(" << c << "), 1.0);\n";
+                else if (axes[a] == 2) out << "        " << c << " = frac(" << c << ");\n";
+                else if (axes[a] == 3)
+                    out << "        { float m = frac(" << c << " * 0.5) * 2.0; " << c << " = m > 1.0 ? 2.0 - m : m; }\n";
+            }
+        }
+        coord += " * texScale[" + Num(slot) + "].xy";
+        if (cubeFetch) coord = "float3(" + coord + (cube ? ", face)" : ", 0.0)");
+        const std::string sampler = "xs[" + Num(slot & 15) + "]";
+        const bool grad = in.useComputedLod() && !((word >> 17) & 1);
+        if (!grad)
+            out << "        float4 f = " << t << ".SampleLevel(" << sampler << ", " << coord << ", 0);\n";
+        else if (spec->implicitLod && !axes[0] && !axes[1])
+            out << "        float4 f = " << t << ".Sample(" << sampler << ", " << coord << ");\n";
+        else
+        {
+            out << "        float2 xg = uv * texScale[" << slot << "].xy, gx = ddx(xg), gy = ddy(xg);\n";
+            out << "        float4 f = " << t << ".SampleGrad(" << sampler << ", " << coord
+                << (cubeFetch ? ", float3(gx, 0.0), float3(gy, 0.0));\n" : ", gx, gy);\n");
+        }
+        // The fetch result: one constructor of texel components and constants, skipped when it is f itself.
+        if ((word & 0xFFF) != 0x688)
+        {
+            static const char* const component[6] = { "f.x", "f.y", "f.z", "f.w", "0.0", "1.0" };
+            out << "        f = float4(";
+            for (int i = 0; i < 4; ++i)
+            {
+                const uint32_t c = (word >> (3 * i)) & 7;
+                out << (i ? ", " : "") << component[c < 6 ? c : 0];
+            }
+            out << ");\n";
+        }
+        FetchTail(in);
+    }
+
+    // Shared end of a tfetch: the destination writes (and the R1d diagnostic).
+    void FetchTail(const TFetch& in)
+    {
         // TTT2_PS_FAKE_TEX=1 (diagnostics, R1d): overwrite the fetch with a constant so the shader compiler drops
         // the sample, its derivatives and the per-fetch uniform logic; the ALU work after the fetch stays.
         static const bool fakeTex = [] { const char* e = std::getenv("TTT2_PS_FAKE_TEX"); return e && *e == '1'; }();
@@ -819,11 +934,15 @@ inline void EmitProgram(const std::vector<uint32_t>& code, detail::Writer& w, bo
 
 // Translate pixel-shader microcode (host-order dwords). Empty code exports r0, as on CPU.
 // exactFilter: emulate the interpreter's filtering arithmetic with Load (parity tests only).
-inline PsTranslation TranslatePixelShader(const std::vector<uint32_t>& code, bool exactFilter = false)
+// spec: the draw's texture state to compile in (PsTexSpec; ignored with exactFilter). Null: the generic
+// text, the same as before the option existed.
+inline PsTranslation TranslatePixelShader(const std::vector<uint32_t>& code, bool exactFilter = false,
+                                          const PsTexSpec* spec = nullptr)
 {
     PsTranslation result;
     detail::Writer w;
     w.exactFilter = exactFilter;
+    w.spec = spec;
     bool branching = false;            // program-counter form (no break-based wrapper)
     if (code.empty())
         w.out << "    e0 = " << w.R(0) << ";\n";
