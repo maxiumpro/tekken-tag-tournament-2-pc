@@ -34,6 +34,7 @@
 #include "gpu_hw_dirty_tracker.h"
 #include "gpu_adapter.h"
 #include "display_settings.h"
+#include "gpu_hw_metalfx.h"
 #include "../host_window.h"
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1680,6 +1681,7 @@ private:
     {
         backRtv_.Reset();
         backRtvFor_ = nullptr;
+        metalfx::Release();
         BindRenderTargets(nullptr, nullptr);
         context_->Flush();
         const HRESULT hr = swapchain_->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, SwapChainFlags());
@@ -1707,7 +1709,7 @@ private:
     ComPtr<ID3D11SamplerState> presentSampler_;
     ComPtr<ID3D11Buffer> presentCb_;
     struct PostTarget { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11ShaderResourceView> srv; UINT w = 0, h = 0; };
-    PostTarget post_[3];
+    PostTarget post_[4];    // [3]: MetalFX's output (gpu_hw_metalfx.h), written by Metal only
     PostTarget& Post(int i, UINT w, UINT h)
     {
         PostTarget& p = post_[i];
@@ -1948,9 +1950,36 @@ private:
             cur = p1.srv.Get();
         }
         cb.mode = !resample ? 0u : vw > sw ? 1u : 2u;
+        // MetalFX (macOS, TTT2_METALFX=1, gpu_hw_metalfx.h) in place of the enlarging pass: the
+        // window-area image, then CAS or texel for texel. Off or failed: the passes as before.
+        bool upscaled = false;
+        if (cb.mode == 1u && metalfx::Available())
+        {
+            PostTarget& p3 = Post(3, vw, vh);
+            static const bool mfxSync = [] { const char* e = std::getenv("TTT2_METALFX_SYNC"); return e && *e == '1'; }();
+            if (mfxSync)
+            {
+                // TTT2_METALFX_SYNC=1 (debugging): the GPU idle before the upscale, as in Present's diag block.
+                if (!diagQuery_)
+                {
+                    D3D11_QUERY_DESC q{ D3D11_QUERY_EVENT, 0 };
+                    device_->CreateQuery(&q, &diagQuery_);
+                }
+                context_->Flush();
+                context_->End(diagQuery_.Get());
+                BOOL done = FALSE;
+                while (context_->GetData(diagQuery_.Get(), &done, sizeof(done), 0) != S_OK || !done) HostYield();
+            }
+            if (metalfx::Upscale(device_.Get(), context_.Get(), (aa ? post_[1] : post_[0]).tex.Get(), p3.tex.Get()))
+            {
+                upscaled = true;
+                cur = p3.srv.Get();
+                cb = PresentCB{ float(vw), float(vh), float(vw), float(vh), float(vx), float(vy), 0.0f, 0 };
+            }
+        }
         if (sharpness)
         {
-            if (resample)
+            if (resample && !upscaled)
             {
                 PostTarget& p2 = Post(2, vw, vh);
                 const D3D11_VIEWPORT area{ 0, 0, float(vw), float(vh), 0, 1 };

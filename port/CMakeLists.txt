@@ -514,6 +514,15 @@ if(APPLE)
     add_executable(tekken_recomp_mac $<TARGET_OBJECTS:ttt2_mac_runtime> "${_ttt2_rt}/apple_import.mm")
     set_source_files_properties("${_ttt2_rt}/apple_import.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-O2")
     target_link_libraries(tekken_recomp_mac PRIVATE ttt2_setup_core "-framework AppKit")
+    # MetalFX at presentation (kernel/gpu_hw_metalfx.h): outside the runtime objects, so it gets
+    # neither the PPC overlay's forced include nor DXVK's Windows headers; the bundle's Vulkan
+    # headers have VK_EXT_metal_objects. MetalFX is weak: without it the bicubic path stays.
+    target_sources(tekken_recomp_mac PRIVATE "${_ttt2_rt}/kernel/gpu_hw_metalfx_mac.mm")
+    set_source_files_properties("${_ttt2_rt}/kernel/gpu_hw_metalfx_mac.mm" PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc;-O2"
+        INCLUDE_DIRECTORIES "${_ttt2_mac_install}/vulkan/include")
+    target_link_libraries(tekken_recomp_mac PRIVATE "-framework Foundation" "-framework Metal"
+        "-weak_framework MetalFX")
     # The runtime's overrides (strong sub_X) beat the archive's PPC_WEAK_FUNC
     # wrappers: XenonRecomp emits wrappers, not aliases, on Apple.
     target_link_libraries(tekken_recomp_mac PRIVATE ttt2_mac_ppc ttt2_ffmpeg SDL3::SDL3

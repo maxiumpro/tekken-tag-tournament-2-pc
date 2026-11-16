@@ -51,6 +51,10 @@ TTT2_VFS_ROOT=<game>/game_files_x mac/build/game/tekken_recomp_mac <game>/tekken
 ```
 
 - `TTT2_FRAMETIME=1`: frame and pipeline timing in the log.
+- `TTT2_METALFX=1` (experimental, off by default): Apple's MetalFX spatial scaler instead of the bicubic pass when the
+  window's 16:9 area is larger than the render size; `TTT2_METALFX_SYNC=1` waits for the GPU around it (debugging).
+- MetalFX falls back to the bicubic pass with one `[metalfx] off: <reason>` log line (variable off, no `VK_EXT_metal_objects`,
+  no MetalFX, a scale it does not take, a failed export); `[metalfx] on: ...` says it runs.
 - `TTT2_NET=loopback`: online between two copies on one Mac. The second one runs with `TTT2_INSTANCE=B` and
   its own `TTT2_SAVE_ROOT`. Add `TTT2_NET_DELAY`, `_JITTER`, `_LOSS` to simulate a network.
 - `TTT2_AUDIO_MUTE=1`: the real audio device at zero gain. Pacing stays as in an audible run;

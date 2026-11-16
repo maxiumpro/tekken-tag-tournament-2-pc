@@ -1,0 +1,18 @@
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index 9db50ae4..fc25b099 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -320,6 +320,13 @@ namespace dxvk {
+     
+     // Enable additional extensions if necessary
+     extensionsEnabled.merge(m_extraExtensions);
++
++    // TTT2 on macOS: MetalFX at presentation (port/src/runtime/kernel/gpu_hw_metalfx_mac.mm)
++    // reads the MTLTextures and the MTLCommandQueue behind DXVK's images and queue through
++    // vkExportMetalObjectsEXT. Enabled whenever MoltenVK offers it, never required.
++    if (m_deviceExtensions.supports("VK_EXT_metal_objects"))
++      extensionsEnabled.add("VK_EXT_metal_objects");
++
+     DxvkNameList extensionNameList = extensionsEnabled.toNameList();
+ 
+     // Enable additional device features if supported
