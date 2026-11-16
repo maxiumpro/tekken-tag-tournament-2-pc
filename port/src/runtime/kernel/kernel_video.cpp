@@ -2332,13 +2332,23 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
     }
 }
 
+// The game stores the ring packets, then (after eieio, a release fence in the generated code)
+// the CP_RB_WPTR doorbell. Pair it with an acquire fence: x86 keeps loads in order anyway, but
+// arm64 may read packet words before the doorbell and see a packet that is not complete yet.
+static uint32_t ReadRingDoorbell()
+{
+    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return doorbell;
+}
+
 static void ConsumeRing()
 {
     uint32_t rb = g_ringBase, rs = g_ringSize;
     if (!rb || !rs) return;
     // Consume only what the game PUBLISHED via the CP_RB_WPTR doorbell (MMIO 0x7FC80714,
     // dword index; mirrored at device+11088) - the CPU cursor at device+48 races the writes.
-    uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    uint32_t doorbell = ReadRingDoorbell();
     uint32_t wptrOff;
     if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;   // dword index, including zero
     else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
@@ -2400,7 +2410,7 @@ uint32_t GpuRingPendingBytes()
 {
     const uint32_t rb = g_ringBase, rs = g_ringSize;
     if (!rb || !rs) return 0;
-    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    const uint32_t doorbell = ReadRingDoorbell();
     uint32_t wptrOff;
     if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;
     else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
@@ -2412,7 +2422,7 @@ bool GpuRingDrained()
 {
     const uint32_t rb = g_ringBase, rs = g_ringSize;
     if (!rb || !rs) return true;
-    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    const uint32_t doorbell = ReadRingDoorbell();
     uint32_t wptrOff;
     if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;
     else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
@@ -2614,7 +2624,7 @@ static void VideoTick()
             {
                 uint32_t rb2 = g_ringBase.load(), rs2 = g_ringSize.load();
                 if (!rb2 || !rs2) break;
-                uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+                uint32_t doorbell = ReadRingDoorbell();
                 uint32_t wptrOff;
                 if ((uint64_t)doorbell * 4 < rs2) wptrOff = doorbell * 4;
                 else if (doorbell >= rb2 && doorbell < rb2 + rs2) wptrOff = doorbell - rb2;

@@ -45,7 +45,7 @@ if [[ ! -f Makefile ]]; then
     PATH="$bison_dir:$PATH" \
     CC="clang -arch $arch" \
     CFLAGS="${CFLAGS:--O2 -g} -ffile-prefix-map=$src=. -ffile-prefix-map=$build=build" \
-    CPPFLAGS="-I$spirv_include" SONAME_LIBVULKAN=libvulkan.1.dylib \
+    CPPFLAGS="-I$spirv_include -I$deps/install-$arch/vulkan/include" SONAME_LIBVULKAN=libvulkan.1.dylib \
         "$src/configure" --host="$host" --prefix="$prefix" \
         --disable-maintainer-mode --disable-tests --disable-demos --disable-doxygen-doc \
         --with-xcb=no --with-opengl=no --with-ncurses=no \
