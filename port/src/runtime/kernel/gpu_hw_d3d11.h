@@ -893,13 +893,13 @@ public:
             else if (ShadowMapOff(depthBase, pitch, height))
             {
                 const float lit[4] = { 0, 0, 0, 0 };     // SHADOWS OFF: no occluder anywhere (see ShadowCaster)
-                context_->ClearRenderTargetView(r.rtv.Get(), lit);
+                (++passClears_, context_)->ClearRenderTargetView(r.rtv.Get(), lit);
             }
             else if (d != depths_.end() && d->second.touched) BlitDepth(d->second, r);
             else
             {
                 const float farDepth[4] = { 1, 1, 1, 1 };                 // depth surfaces start at 1.0
-                context_->ClearRenderTargetView(r.rtv.Get(), farDepth);
+                (++passClears_, context_)->ClearRenderTargetView(r.rtv.Get(), farDepth);
             }
             r.copiedWidth = pitch;
         }
@@ -910,7 +910,7 @@ public:
             const uint32_t px = hasLatch ? latch : 0;
             const float c[4] = { (px & 0xFF) / 255.0f, ((px >> 8) & 0xFF) / 255.0f,
                                  ((px >> 16) & 0xFF) / 255.0f, ((px >> 24) & 0xFF) / 255.0f };
-            context_->ClearRenderTargetView(r.rtv.Get(), c);
+            (++passClears_, context_)->ClearRenderTargetView(r.rtv.Get(), c);
             r.copiedWidth = pitch;
         }
         else
@@ -926,7 +926,7 @@ public:
             if ((width != r.copiedWidth && width < pitch) || haveW < copyW || haveH < copyH)
             {
                 const float zero[4] = { 0, 0, 0, 0 };
-                context_->ClearRenderTargetView(r.rtv.Get(), zero);
+                (++passClears_, context_)->ClearRenderTargetView(r.rtv.Get(), zero);
             }
             if (!s.tex || (toggle_ & 4)) {}
             else if (r.rg16f) BlitColor(s, r, width, rows, true);
@@ -934,7 +934,7 @@ public:
             else
             {
                 D3D11_BOX box{ 0, 0, 0, haveW, haveH, 1 };
-                context_->CopySubresourceRegion(r.tex.Get(), 0, 0, 0, 0, s.tex.Get(), 0, &box);
+                (++passCopies_, context_)->CopySubresourceRegion(r.tex.Get(), 0, 0, 0, 0, s.tex.Get(), 0, &box);
             }
             r.copiedWidth = width;
         }
@@ -1542,6 +1542,8 @@ private:
     display_settings::Resolution exclusiveRes_{ 0, 0 };     // display mode set for exclusive fullscreen
     HRESULT lastPresentHr_ = S_OK;
     uint32_t toggle_ = 0;                         // TTT2_HW_TOGGLE
+    // Render-pass break counters (likely Metal encoder splits under DXVK/MoltenVK), per 5 s report.
+    uint64_t passRtSwitches_ = 0, passClears_ = 0, passCopies_ = 0;
     std::array<uint32_t, 8> presentHist_{};      // TTT2_FRAMETIME: DXGI Present durations, calls, would-block
     double presentHistMs_ = 0;
     ComPtr<ID3D11Query> diagQuery_;              // TTT2_PRESENT_DIAG
@@ -1907,7 +1909,7 @@ private:
         const D3D11_VIEWPORT out{ float(vx), float(vy), float(vw), float(vh), 0, 1 };
         const float black[4] = { 0, 0, 0, 1 };
         ID3D11RenderTargetView* rtv = backRtv_.Get();
-        context_->ClearRenderTargetView(rtv, black);
+        (++passClears_, context_)->ClearRenderTargetView(rtv, black);
         ComPtr<ID3D11ShaderResourceView> srv;
         Check(device_->CreateShaderResourceView(source, nullptr, &srv), "CreatePresentSrv");
         context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
@@ -2415,7 +2417,7 @@ private:
 #endif
         if (same && !force) return;
         context_->OMSetRenderTargets(color ? 1 : 0, color ? &color : nullptr, depth);
-        if (!same) { boundRenderTarget_ = color; boundDepthTarget_ = depth; }
+        if (!same) { boundRenderTarget_ = color; boundDepthTarget_ = depth; ++passRtSwitches_; }
         targetBindingValid_ = true;
     }
     // CPU-read readbacks: a fence signalled after each staged copy, so the reading thread can wait
@@ -3726,7 +3728,7 @@ private:
         Check(device_->CreateRenderTargetView(s.tex.Get(), nullptr, &s.rtv), "CreateColorRtv");
         Check(device_->CreateShaderResourceView(s.tex.Get(), nullptr, &s.srv), "CreateColorSrv");
         const float zero[4] = { 0, 0, 0, 0 };          // the CPU store starts zeroed
-        context_->ClearRenderTargetView(s.rtv.Get(), zero);
+        (++passClears_, context_)->ClearRenderTargetView(s.rtv.Get(), zero);
     }
     void MakeDepthTexture(DepthSurface& s, float scale)
     {
@@ -3747,7 +3749,7 @@ private:
         D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
         sv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
         Check(device_->CreateShaderResourceView(s.tex.Get(), &sv, &s.srv), "CreateDepthSrv");
-        context_->ClearDepthStencilView(s.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);   // CPU store starts at 1.0
+        (++passClears_, context_)->ClearDepthStencilView(s.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);   // CPU store starts at 1.0
     }
     void LogGrowth(const char* kind, uint32_t key, UINT w, UINT h, float scale)
     {
@@ -3773,7 +3775,7 @@ private:
         if (old && oldScale == scale)
         {
             D3D11_BOX box{ 0, 0, 0, oldW, oldH, 1 };
-            context_->CopySubresourceRegion(s.tex.Get(), 0, 0, 0, 0, old.Get(), 0, &box);
+            (++passCopies_, context_)->CopySubresourceRegion(s.tex.Get(), 0, 0, 0, 0, old.Get(), 0, &box);
         }
         else if (old)
             Resample(oldSrv.Get(), s.rtv.Get(), nullptr, AllocPx(oldExtW, scale), AllocPx(oldExtH, scale), 1.0f / float(AllocPx(oldExtW, scale)),
@@ -3933,7 +3935,7 @@ private:
             ++stats_.resolveCreates;
         }
         const float zero[4] = { 0, 0, 0, 0 };
-        context_->ClearRenderTargetView(r.rtv.Get(), zero);
+        (++passClears_, context_)->ClearRenderTargetView(r.rtv.Get(), zero);
         r.scale = scale;
     }
     double SurfaceMegabytes() const
@@ -4433,7 +4435,7 @@ private:
             Check(device_->CreateTexture2D(&s, nullptr, &r.staging), "CreateReadbackStaging");
         }
         D3D11_BOX box{ 0, 0, 0, r.pitch, r.height, 1 };
-        context_->CopySubresourceRegion(r.staging.Get(), 0, 0, 0, 0, source, 0, &box);
+        (++passCopies_, context_)->CopySubresourceRegion(r.staging.Get(), 0, 0, 0, 0, source, 0, &box);
         if (readbackFence_) context4_->Signal(readbackFence_.Get(), r.stagedFence = ++readbackFenceValue_);
         if (completion) context_->End(completion);
         Probe("staged copy");
@@ -4603,7 +4605,7 @@ private:
         ComPtr<ID3D11Texture2D> staging;
         Check(device_->CreateTexture2D(&d, nullptr, &staging), "CreateStaging");
         D3D11_BOX box{ 0, 0, 0, width, height, 1 };
-        context_->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex, 0, &box);
+        (++passCopies_, context_)->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex, 0, &box);
         D3D11_MAPPED_SUBRESOURCE m{};
         const auto mapStart = std::chrono::steady_clock::now();
         Check(context_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m), "MapStaging");
@@ -4823,6 +4825,12 @@ private:
             pixelShaders_.size(), textures_.size(), (unsigned long long)d.gpuVsDraws,
             double(d.vertexDataBytes) / 1048576.0, vertexShaders_.size(), (unsigned long long)ringWaits, ringWaitMs,
             (unsigned long long)resolveCreates, (unsigned long long)resolvePoolHits);
+        if (d.presents)
+            std::fprintf(stderr, "[gpu-hw]   pass breaks: rt_switches=%llu (%.1f/frame) clears=%llu (%.1f/frame) copies=%llu (%.1f/frame)\n",
+                (unsigned long long)passRtSwitches_, double(passRtSwitches_) / double(d.presents),
+                (unsigned long long)passClears_, double(passClears_) / double(d.presents),
+                (unsigned long long)passCopies_, double(passCopies_) / double(d.presents));
+        passRtSwitches_ = passClears_ = passCopies_ = 0;
         ReportFrameCost(s, d.presents);
         if (VcacheStatsOn())
         {
