@@ -802,10 +802,19 @@ public:
         context_->RSSetViewports(1, &vp);
         D3D11_RECT scissor{ LONG(Px(std::max(st.scX0, 0) * int(st.sampX), sc)), LONG(Px(std::max(st.scY0, 0) * int(st.sampY), sc)),
                             LONG(Px(double(x1), sc)), LONG(Px(double(y1), sc)) };
-        context_->RSSetScissorRects(1, &scissor);
+        // R1c (TTT2_HW_TOGGLE 64): a 1x1 scissor keeps every pass, switch, clear and copy but drops fragment shading.
+        const D3D11_RECT onePixel{ 0, 0, 1, 1 };
+        context_->RSSetScissorRects(1, (toggle_ & 64) ? &onePixel : &scissor);
         if ((st.cull & 3) == 3) { ++stats_.emptyDraws; return; }          // both faces culled
         context_->RSSetState(RasterState(st));
-        context_->PSSetShader(ps, nullptr, 0);
+        // R1c (TTT2_HW_TOGGLE 128): a flat-colour pixel shader keeps passes, overdraw and blending, drops texture/ALU work.
+        if ((toggle_ & 128) && !flatPs_)
+        {
+            auto code = Compile("float4 main(float4 pos : SV_Position) : SV_Target { return float4(0.5, 0.5, 0.5, 1); }",
+                                "ps_5_0", "ttt2 flat ps (R1c)");
+            Check(device_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &flatPs_), "CreateFlatPs");
+        }
+        context_->PSSetShader((toggle_ & 128) ? flatPs_.Get() : ps, nullptr, 0);
         if (constantRingsActive_)
         {
             ID3D11Buffer* buffers[] = {psConstantsRing_.buffer.Get(), psStateRing_.buffer.Get()};
@@ -1544,6 +1553,7 @@ private:
     uint32_t toggle_ = 0;                         // TTT2_HW_TOGGLE
     // Render-pass break counters (likely Metal encoder splits under DXVK/MoltenVK), per 5 s report.
     uint64_t passRtSwitches_ = 0, passClears_ = 0, passCopies_ = 0;
+    ComPtr<ID3D11PixelShader> flatPs_;   // R1c toggle 128
     std::array<uint32_t, 8> presentHist_{};      // TTT2_FRAMETIME: DXGI Present durations, calls, would-block
     double presentHistMs_ = 0;
     ComPtr<ID3D11Query> diagQuery_;              // TTT2_PRESENT_DIAG
