@@ -1267,10 +1267,12 @@ public:
             // 2 GPU-VS draws whole (vertex data too), 4 resolve copies, 8 staged readbacks,
             // 16 DXGI Present, 32 constant uploads.
             static const bool toggleFile = [] { const char* e = std::getenv("TTT2_HW_TOGGLE"); return e && *e == '1'; }();
+            // TTT2_HW_TOGGLE_FILE: where the mask file is on hosts without C:/ttt2 (macOS).
+            static const char* togglePath = [] { const char* e = std::getenv("TTT2_HW_TOGGLE_FILE"); return e && *e ? e : "C:/ttt2/port/hw_toggle.txt"; }();
             if (toggleFile && stats_.presents % 30 == 0)
             {
                 uint32_t mask = 0;
-                if (FILE* f = std::fopen("C:/ttt2/port/hw_toggle.txt", "r")) { if (std::fscanf(f, "%x", &mask) < 1) mask = 0; std::fclose(f); }
+                if (FILE* f = std::fopen(togglePath, "r")) { if (std::fscanf(f, "%x", &mask) < 1) mask = 0; std::fclose(f); }
                 if (mask != toggle_)
                 {
                     if (timing) printHist();
@@ -3619,7 +3621,7 @@ private:
     static float RequestedScale()
     {
         if (ScaleOverride() > 0) return std::clamp(ScaleOverride(), 0.5f, 4.0f);
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__APPLE__)   // live scale file (Mac: R1 bench)
         if (const char* path = std::getenv("TTT2_RENDER_SCALE_FILE"); path && *path)
         {
             float value = 0.0f;
@@ -3642,7 +3644,7 @@ private:
     void UpdateScale()
     {
         const uint32_t g = display_settings::Generation();
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__APPLE__)
         const auto now = std::chrono::steady_clock::now();
         if (g == scaleGeneration_ && now < nextScalePoll_) return;
         nextScalePoll_ = now + std::chrono::seconds(1);
