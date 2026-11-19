@@ -4,7 +4,7 @@
 //
 // External symbols this file needs (the core harness m1/core_test.mm defines its own copies, so it links
 // without the game): display_settings::GetVSync / GetSharpness / GetAntiAliasing, host_window::SDLHandle,
-// and Backend::Impl::FrontTexture (gpu_hw_metal_stubs.mm in the game).
+// and Backend::Impl::FrontTexture (gpu_hw_metal_surfaces.mm in the game).
 
 #include "gpu_hw_metal_impl.h"
 #include "display_settings.h"
