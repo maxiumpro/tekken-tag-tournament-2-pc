@@ -127,7 +127,11 @@ Window* Open(uint32_t width, uint32_t height)
     // makes the layer as large as the window in pixels; the back buffer follows
     // SDL_GetWindowSizeInPixels. TTT2_HIGH_DPI=0 renders at point size (the system scales it).
     if (const char* hw = std::getenv("TTT2_GPU_HW"); !(hw && *hw == '0'))
+#if defined(TTT2_GPU_HW_METAL)
+        flags |= SDL_WINDOW_METAL;      // R4 Metal backend: SDL_Metal_CreateView on this window, no Vulkan
+#else
         flags |= SDL_WINDOW_VULKAN;
+#endif
     if (const char* hiDpi = std::getenv("TTT2_HIGH_DPI"); !(hiDpi && *hiDpi == '0'))
         flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #endif
