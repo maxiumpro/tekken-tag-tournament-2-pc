@@ -479,7 +479,7 @@ void Backend::Impl::WriteBack(uint32_t dest, MtlResolved& r)
         id<MTLTexture> source = r.tex;                                                             // D4678
         if (uint32_t(r.tex.width) != r.pitch || uint32_t(r.tex.height) != r.height)                // D4679
         {
-            id<MTLTexture>& logical = st.logical[PoolKey(r.pitch, r.height, r.tex.pixelFormat)];   // D4681-4688 r.logical
+            __strong id<MTLTexture>& logical = st.logical[PoolKey(r.pitch, r.height, r.tex.pixelFormat)];   // D4681-4688 r.logical
             if (!logical) logical = NewTexture(*this, r.tex.pixelFormat, r.pitch, r.height, "readback logical target");
             ResampleColor(*this, r.tex, logical, MTLLoadActionDontCare, r.pitch, r.height, 1.0f / float(r.pitch),
                           1.0f / float(r.height), !r.depth && Filterable(r.tex.pixelFormat), "readback resample");   // D4689-4690

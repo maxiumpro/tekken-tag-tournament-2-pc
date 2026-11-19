@@ -284,7 +284,7 @@ id<MTLBuffer> Staging(Impl& m, const std::vector<const std::vector<uint8_t>*>& p
 id<MTLTexture> DefaultTexture(Impl& m, bool array)
 {
     TextureState& s = TexState();
-    id<MTLTexture>& tex = array ? s.defaultArrayTex : s.defaultTex;
+    __strong id<MTLTexture>& tex = array ? s.defaultArrayTex : s.defaultTex;
     if (tex) return tex;
     const uint32_t slices = array ? 6u : 1u;
     MTLTextureDescriptor* d = [MTLTextureDescriptor new];
