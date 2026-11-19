@@ -7,6 +7,7 @@
 // and Backend::Impl::FrontTexture (gpu_hw_metal_surfaces.mm in the game).
 
 #include "gpu_hw_metal_impl.h"
+#import <QuartzCore/CATransaction.h>
 #include "display_settings.h"
 
 #import <Foundation/Foundation.h>
