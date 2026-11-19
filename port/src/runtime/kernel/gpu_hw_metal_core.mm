@@ -321,6 +321,7 @@ bool Backend::Present(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* 
     @autoreleasepool {
         Impl& m = *impl_;
         m.Initialize();                                                          // D1263
+        m.EndPass();   // FrontTexture may blit (CPU front buffer); no render encoder may stay open
         ThrowPendingCommandError();
         m.UpdateGamma(gammaRamp, gammaVersion);                                  // D1267
         bool storedSwap = false;
@@ -403,6 +404,7 @@ id<MTLCommandBuffer> Backend::Impl::Cmd()
 
 void Backend::Impl::Submit(bool wait)
 {
+    EndPass();                                   // draw's render encoder ends before the commit (impl.h, draw section)
     id<MTLCommandBuffer> cb = frameCmd;
     frameCmd = nil;
     ThrowPendingCommandError();
@@ -502,6 +504,7 @@ bool Backend::Impl::PresentTexture(id<MTLTexture> source, uint32_t logicalW, uin
         if (sharpness && !c.loggedCas) { c.loggedCas = true; std::fprintf(stderr, "[gpu-metal] CAS not implemented (M5)\n"); }
         const bool resample = sw != vw || sh != vh;                                              // D2044
         PresentCB cb{ float(sw), float(sh), float(vw), float(vh), float(vx), float(vy), 0.0f, 0 };   // D2045
+        EndPass();                                                                               // before Pass opens its encoders
         id<MTLCommandBuffer> cmd = Cmd();
         // D2046: sizes equal (FXAA / CAS skipped in M1): the display pass writes the drawable directly.
         if (!resample) Pass(cmd, back, true, out, outSc, display, source, lut, &cb, sizeof(cb));
@@ -540,6 +543,7 @@ bool Backend::Impl::ReadLogical(id<MTLTexture> tex, uint32_t logicalW, uint32_t 
             c.readBuffer = [device newBufferWithLength:size_t(w) * h * 4 options:MTLResourceStorageModeShared];
             if (!c.readBuffer) throw Failure("metal: readback buffer");
         }
+        EndPass();                                                                               // before Pass / the blit encoder
         id<MTLCommandBuffer> cmd = Cmd();
         id<MTLTexture> from = tex;
         // D4891: at scale 1 a plain copy (BGRA8 already); otherwise read on the GPU at logical pixel centres.

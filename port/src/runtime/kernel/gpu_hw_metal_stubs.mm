@@ -17,23 +17,6 @@ extern uint8_t* g_base;   // kernel_shared.h: global guest memory base
 
 namespace ttt2_hw {
 
-bool Backend::Draw(const uint32_t*, const std::vector<uint32_t>&, const std::vector<CpuVertex>&,
-                   const std::vector<uint32_t>&, uint32_t, const DrawState&)
-{
-    throw Failure("metal: Draw not implemented (M1 slice 2)");
-}
-
-VertexShaderHandle* Backend::VertexShader(const std::vector<uint32_t>&)
-{
-    return nullptr;   // M1: always the CPU vertex stage (gpu_hw_metal.h)
-}
-
-GpuVsResult Backend::DrawGpuVs(const uint32_t*, const std::vector<uint32_t>&, VertexShaderHandle&,
-                               std::span<const uint32_t>, uint32_t, uint32_t, const DrawState&, bool, uint32_t, uint64_t)
-{
-    return GpuVsResult::Fallback;   // nothing changed; the caller runs the CPU vertex stage
-}
-
 void Backend::Resolve(uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t, bool, uint32_t, uint32_t, bool, uint32_t)
 {
     throw Failure("metal: Resolve not implemented (M1 slice 4)");
