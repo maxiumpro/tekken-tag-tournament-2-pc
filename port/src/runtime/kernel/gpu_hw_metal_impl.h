@@ -19,6 +19,8 @@
 
 struct SDL_Window;
 
+namespace ttt2_hw { class DirtyTracker; }   // gpu_hw_dirty_tracker.h (needs host_vm: only the game links it)
+
 namespace ttt2_hw {
 
 // ---------------------------------------------------------------- shared value types
@@ -31,6 +33,7 @@ struct MtlResolved {
     id<MTLTexture> tex = nil;          // at the SOURCE surface's scale (D976)
     uint32_t pitch = 0, height = 0, copiedWidth = 0, size = 0;
     uint64_t seq = 0, revision = 0;
+    uint32_t sourceKey = 0, sourcePitch = 0;   // D981-982
     bool valid = false, cpuCoherent = false, swapRB = false, depth = false, depthFloat = false, rg16f = false;
     float scale = 1;
 };
@@ -116,6 +119,12 @@ struct Backend::Impl {
     MtlDepthSurface& Depth(uint32_t base);                               // D3865
     void Grow(MtlColorSurface& s, uint32_t key, uint32_t w, uint32_t h, float scale);   // D4027-4047
     void Grow(MtlDepthSurface& s, uint32_t base, uint32_t w, uint32_t h, float scale);  // D4048-4063
+    // Page-sequence tracker over guest memory (D2931 `DirtyTracker dirty_{g_base}`), created on first use.
+    DirtyTracker& Dirty();
+    // Synchronous readback of one resolve into guest memory (D4795-4805: stage, wait, scatter tiled words).
+    // textures calls it for an overlapping non-exact view of resolved bytes (D4525-4535); WriteBackRange uses it
+    // in M1 (the async staging of D1100-1190 / D4674-4791 is M2).
+    void WriteBack(uint32_t dest, MtlResolved& r);
 };
 
 // Test hook (core): lets a harness without the game show a texture through the real present path.
