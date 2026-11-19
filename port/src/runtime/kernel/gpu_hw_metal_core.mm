@@ -162,6 +162,9 @@ CoreState& Core() { static CoreState* s = new CoreState; return *s; }   // leake
 // RemovedReason(): the last command-buffer error, recorded by the completed handler (never thrown there);
 // pendingError makes the next Cmd() / Submit() throw it.
 std::atomic<long> g_lastCommandError{0};
+// Drawables the display actually showed (presentedTime > 0) vs. dropped without reaching the screen: the on-screen
+// check that needs no screen capture (the 19-nov black window: frames fine, nothing shown).
+std::atomic<uint64_t> g_drawablesShown{0}, g_drawablesDropped{0};
 std::atomic<bool> g_pendingCommandError{false};
 
 // The test hooks are free functions and Backend::impl_ is private: the constructor records the link.
@@ -270,11 +273,14 @@ bool EnsureLayer(Backend::Impl& m)
     if (m.metalView) return true;
     // The view comes from host_window_sdl.cpp, made on the main thread (an NSView made here, on the presenting
     // thread, never reached the screen). Only a harness without that window code makes it here.
-    SDL_MetalView view = static_cast<SDL_MetalView>(
+    // TTT2_METAL_VIEW_HERE=1: the pre-d291023 behaviour (view made on this thread), only to A/B the fix.
+    const char* here = std::getenv("TTT2_METAL_VIEW_HERE");
+    const bool legacy = here && *here == '1';
+    SDL_MetalView view = legacy ? nullptr : static_cast<SDL_MetalView>(
         SDL_GetPointerProperty(SDL_GetWindowProperties(w), "ttt2.metal_view", nullptr));
     if (!view)
     {
-        if (![NSThread isMainThread])
+        if (!legacy && ![NSThread isMainThread])
             throw Failure("metal: no main-thread Metal view on the window (host_window_sdl.cpp makes it)");
         view = SDL_Metal_CreateView(w);
         if (!view) throw Failure(std::string("metal: SDL_Metal_CreateView: ") + SDL_GetError());
@@ -575,6 +581,9 @@ bool Backend::Impl::PresentTexture(id<MTLTexture> source, uint32_t logicalW, uin
             }
             Pass(cmd, back, true, out, outSc, c.scale, c.post0, nil, &cb, sizeof(cb));           // D2099
         }
+        [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+            if (d.presentedTime > 0) g_drawablesShown.fetch_add(1); else g_drawablesDropped.fetch_add(1);
+        }];
         [cmd presentDrawable:drawable];
         Submit(false);
         return true;
@@ -698,6 +707,8 @@ void Backend::Impl::MaybeReportStats()
         std::fprintf(stderr, "[gpu-metal]   gpu busy %.2f ms per frame (median %.2f; %zu frames)\n",
                      nb ? busySum / double(nb) : 0.0, nb ? gpuBusyMs[nb / 2] : 0.0f, nb);
     }
+    std::fprintf(stderr, "[gpu-metal]   drawables on screen %llu, dropped %llu\n",
+                 (unsigned long long)g_drawablesShown.exchange(0), (unsigned long long)g_drawablesDropped.exchange(0));
     c.costCpNs = haveCpu ? cp : 0;
     c.costProcNs = proc;
 }
