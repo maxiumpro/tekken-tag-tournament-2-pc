@@ -126,8 +126,9 @@ int Slot(const std::string& name, const char* prefix)
 // D671-857 PixelStageAndDraw, CPU vertex path (vertex input already uploaded): constants, textures and samplers,
 // output merger, viewport, scissor, rasterizer state, the draw.
 void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlColorSurface& color, const DrawState& st,
-                       const Slice& vb, uint32_t interps, const Slice& ib, uint32_t indexCount, float reachX, float reachY)
+                       Slice vb, size_t vbBytes, uint32_t interps, Slice ib, uint32_t indexCount, float reachX, float reachY)
 {
+    id<MTLCommandBuffer> uploadCmd = m.frameCmd;   // the command buffer whose arena holds vb / ib
     const uint32_t textureSlots = ps.slots, cubeSlots = ps.cubeSlots;                                    // D391 (lastSlots_, lastCubeSlots_)
     // ---- constants and per-draw shader state
     const uint32_t psRows = std::min<uint32_t>(ps.constantRows, 256);                                    // D681 (lastPsRows_)
@@ -150,6 +151,18 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
         samplers[slot & 15] = m.Sampler(slot, cb.texSampler[slot], b.mip);                               // D728-729
     }
     // D695-756: the texture-state, texture-spec and no-discard variants are M3; the generic shader draws.
+    // A synchronous WriteBack inside BindTexture (D4525-4535) commits and waits for the frame's command buffer: its
+    // arena returns to the free list and the next Alloc may reuse it from offset 0. Copy vb / ib out BEFORE any new
+    // Alloc, then upload them again into the new command buffer's arena.
+    if (m.frameCmd != uploadCmd)
+    {
+        const size_t ibBytes = size_t(indexCount) * 4;
+        std::vector<uint8_t> keep(vbBytes + ibBytes);
+        std::memcpy(keep.data(), vb.ptr, vbBytes);
+        std::memcpy(keep.data() + vbBytes, ib.ptr, ibBytes);
+        vb = Alloc(m, vbBytes); std::memcpy(vb.ptr, keep.data(), vbBytes);
+        ib = Alloc(m, ibBytes); std::memcpy(ib.ptr, keep.data() + vbBytes, ibBytes);
+    }
 
     // ---- output merger: the surfaces cover the scissored area (logical samples); a bound colour / depth pair is
     // grown to one size (Metal attachments, like D3D11 views, must agree).
@@ -367,7 +380,7 @@ bool Backend::Draw(const uint32_t* regs, const std::vector<uint32_t>& psCode,
         const Slice ib = Alloc(m, ibBytes);
         std::memcpy(ib.ptr, slots.data(), ibBytes);                                                      // D445
         // D450-456: fixed VS Passthrough(interps), TRIANGLELIST, R32_UINT - in the pipeline (Impl::Pipeline).
-        PixelStageAndDraw(m, regs, *ps, color, st, vb, interps, ib, uint32_t(slots.size()), reachX, reachY);   // D457
+        PixelStageAndDraw(m, regs, *ps, color, st, vb, vbBytes, interps, ib, uint32_t(slots.size()), reachX, reachY);   // D457
         return true;                                                                                     // D458
     }
 }
