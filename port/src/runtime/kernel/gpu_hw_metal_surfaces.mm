@@ -374,8 +374,9 @@ void MakeResolved(Impl& m, MtlResolved& r, float scale)
     {
         r.tex = pooled->second.back();                                                             // D4189-4191
         pooled->second.pop_back();
+        ++m.stats.resolvePoolHits;                                                                 // D4191 (reused)
     }
-    else r.tex = NewTexture(m, f, w, h, "resolve texture");                                        // D4196-4198
+    else { r.tex = NewTexture(m, f, w, h, "resolve texture"); ++m.stats.resolveCreates; }          // D4196-4198 (new)
     r.scale = scale;                                                                               // D4202
 }
 
@@ -506,6 +507,7 @@ void Backend::Impl::WriteBack(uint32_t dest, MtlResolved& r)
                                   [](uint32_t address, uint32_t word) { GWrite32(g_base, address, word); }))
             throw Failure("metal: invalid resolved guest writeback");
         Dirty().Sync(dest, r.size);                                                                // D4817
+        ++stats.writebacks;                                                                        // D1153
         r.seq = Dirty().Current();                                                                 // D4818
         r.cpuCoherent = true;                                                                      // D4819
     }
@@ -571,6 +573,7 @@ void Backend::Resolve(uint32_t colorBase, uint32_t dest, uint32_t pitch, uint32_
     @autoreleasepool {
         Impl& m = *impl_;
         m.Initialize();                                                                            // D955
+        ++m.stats.resolves;                                                                        // D959
         // D956-958: UpdateScale, FinishSmallWritebacks, CancelOverlappingSmallReadbacks - not in M1 (header).
         const bool depth = srcSelect == 4;                                                         // D960
         const bool rg16f = !depth && destFormat == 31;                                             // D961
@@ -603,6 +606,7 @@ void Backend::Resolve(uint32_t colorBase, uint32_t dest, uint32_t pitch, uint32_
         auto it = m.colors.find(colorBase);                                                        // D1003
         if (depth)                                                                                 // D1004
         {
+            ++m.stats.depthResolves;                                                               // D1006
             auto d = m.depths.find(depthBase);                                                     // D1007
             // D1009-1013 (shadow map off -> 0): not in M1.
             if (d != m.depths.end() && d->second.touched && d->second.tex)                         // D1014: BlitDepth (D2745-2783)
@@ -675,6 +679,7 @@ void Backend::Resolve(uint32_t colorBase, uint32_t dest, uint32_t pitch, uint32_
             return e ? uint32_t(std::strtoul(e, nullptr, 0)) : 32u;
         }();
         if (writeback || pitch * height <= smallWriteback || IsHot(dest)) m.WriteBack(dest, r);   // D1087-1089 (synchronous in M1)
+        m.MaybeReportStats();                                                                      // D1090
     }
 }
 

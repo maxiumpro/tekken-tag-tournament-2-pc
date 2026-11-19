@@ -12,7 +12,9 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include "gpu_hw_metal.h"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -63,6 +65,33 @@ struct Backend::Impl {
     // area, present the drawable. D1332, D2012-2100. FXAA/CAS/MetalFX: log once by name and skip (M5).
     bool PresentTexture(id<MTLTexture> source, uint32_t logicalW, uint32_t logicalH, bool swap);
     void UpdateGamma(const uint32_t* ramp, uint32_t version);   // D1517-1552
+
+    // ----- stats (M2a; core owns the report, every file bumps its own counters) -----
+    // Same names and meaning as D3D11's stats_ (D5062-5090); a counter the Metal path has no source for stays 0
+    // and is still printed, so bench/analizar*.py parse the line unchanged.
+    struct Stats {
+        uint64_t draws = 0, triangles = 0, skippedDraws = 0, emptyDraws = 0;       // draw (D382-398, D855)
+        uint64_t resolves = 0, depthResolves = 0, writebacks = 0, stagedReadbacks = 0;  // surfaces (D959, D1006, D1153)
+        uint64_t presents = 0;                                                     // core (D1451)
+        uint64_t compiles = 0, diskHits = 0, warmHits = 0, pendingSkips = 0;       // shaders: diskHits = metallib loads
+        uint64_t uploads = 0, uploadBytes = 0, resolvedHits = 0, depthHits = 0;    // textures
+        uint64_t gpuVsDraws = 0, vertexDataBytes = 0, ringWaits = 0;               // M2b (0 in M1)
+        double ringWaitMs = 0;
+        uint64_t resolveCreates = 0, resolvePoolHits = 0;                          // surfaces
+        uint64_t shadowSkips = 0;
+    };
+    Stats stats, reported;
+    size_t statShaders = 0, statTextures = 0, statVertexShaders = 0;   // cache sizes, set by their owners
+    std::chrono::steady_clock::time_point lastStats = std::chrono::steady_clock::now();
+    // Called at the end of Draw and Resolve (D856, D1090): every >= 5 s prints the D5080 "[gpu-hw] %.1fs: draws=..."
+    // line byte-compatible with D3D11, then the D5044 non-Windows "frame cost:" line. GPU ms per frame = span from
+    // the first GPUStartTime to the last GPUEndTime of the command buffers committed between two presents (the
+    // Metal analogue of D3D11's present-to-present timestamps: includes gaps, an upper bound of busy time); plus a
+    // "[gpu-metal]   gpu busy" line with the summed (GPUEndTime - GPUStartTime).
+    void MaybeReportStats();
+    // Submit/Cmd tag each command buffer with the present sequence it belongs to; the completed handler folds its
+    // GPU times into that frame (handler thread: under statsMutex only).
+    std::mutex statsMutex;
     // 1280x720 BGRX of `tex` resampled at logical pixel centres (D4886-4903), then DisplayPixel (D1488-1495).
     bool ReadLogical(id<MTLTexture> tex, uint32_t logicalW, uint32_t logicalH, std::vector<uint32_t>& out);
 

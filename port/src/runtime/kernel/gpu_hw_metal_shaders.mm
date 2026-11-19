@@ -440,6 +440,7 @@ const Backend::Impl::Ps* Backend::Impl::PixelShader(const std::vector<uint32_t>&
         return it->second.failed ? nullptr : &it->second;
     Initialize();
     Ps& e = s.ps[key];
+    statShaders = s.ps.size();                                                                           // D5086 shaders= (cache size)
     // D3384-3393 BuildPixelShader, generic variant, alpha test on (TranslatePixelShader(code, false, nullptr)).
     const PsTranslation t = TranslatePixelShader(code);                                                  // D3389
     if (!t.unsupported.empty())                                                                          // D3390
@@ -468,6 +469,7 @@ const Backend::Impl::Ps* Backend::Impl::PixelShader(const std::vector<uint32_t>&
                          (unsigned long long)key, (unsigned long long)e.textKey, why.c_str());
         return nullptr;
     }
+    ++stats.diskHits;                                                                                    // D3059-3073 ps_disk= (metallib loaded from disk; compiles / pendingSkips stay 0)
     return &e;
 }
 

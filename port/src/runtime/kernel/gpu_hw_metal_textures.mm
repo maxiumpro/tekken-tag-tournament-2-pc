@@ -383,6 +383,7 @@ void UploadTexture(Impl& m, const Texture& t, CachedTexture& c, uint32_t slices,
         regions.push_back({ offsets[slices + l - 1], mp.bytes.size(), mp.rowPitch, mp.width, mp.height, 0, l });
     }
     BlitUpload(m, staging, c.tex, regions, Compressed(uploadFormat));
+    ++m.stats.uploads; m.stats.uploadBytes += total;                                                     // D4658-4659
     c.allocW = allocW; c.allocH = allocH; c.slices = slices; c.levels = levels;                          // D4657
 }
 
@@ -417,8 +418,11 @@ Impl::Bound BindTextureFrom(Impl& m, const uint32_t* regs, uint32_t slot, bool a
             MtlResolved& r = it->second;                                                                 // D4473
             m.Dirty().Sync(t.base, r.size);                                                              // D4474
             if (m.Dirty().Newest(t.base, r.size) <= r.seq)                                               // D4475
+            {
+                ++m.stats.depthHits;                                                                         // D4477
                 return Make(t, r.tex, t.swizzle, 3u, t.width, t.height,
                             float(t.width) / float(r.pitch), float(t.height) / float(r.height));         // D4479-4480
+            }
             r.valid = false;                                                                             // D4482
         }
     }
@@ -446,8 +450,11 @@ Impl::Bound BindTextureFrom(Impl& m, const uint32_t* regs, uint32_t slot, bool a
         if (m.Dirty().Newest(rs, r.size) > r.seq) { r.valid = false; continue; }   // the CPU overwrote it  // D4516
         if (!array && t.base == rs && (r.rg16f ? t.format == FMT_16_16_FLOAT : t.format == FMT_8_8_8_8) && t.tiled &&   // D4517
             ((t.pitch + 31) & ~31u) == ((r.pitch + 31) & ~31u) && t.width <= r.pitch && t.height <= r.height)            // D4518
+        {
+            ++m.stats.resolvedHits;                                                                      // D4520
             return Make(t, r.tex, t.swizzle, (r.swapRB && !r.rg16f) ? 2u : 0u, t.width, t.height,
                         float(t.width) / float(r.pitch), float(t.height) / float(r.height));             // D4522-4523
+        }
         // Any other view of resolved bytes reads guest memory: make it coherent once.
         if (!r.cpuCoherent) m.WriteBack(rs, r);                                                          // D4527-4534
     }
@@ -475,6 +482,7 @@ Impl::Bound BindTextureFrom(Impl& m, const uint32_t* regs, uint32_t slot, bool a
     }
     CachedTexture& c = s.textures[key];                                                                  // D4564
     UploadTexture(m, t, c, slices, array, levels);                                                       // D4565
+    m.statTextures = s.textures.size();                                                                  // D5086 textures= (cache size)
     c.rangeStart = t.base; c.rangeSize = bytes; c.mipStart = mipStart; c.mipSize = mipSize; c.seq = m.Dirty().Current();   // D4566
     return Make(t, c.tex, c.genericSwizzled ? 0x688u : t.swizzle, c.mode, t.width, t.height,
                 float(t.width) / float(c.allocW), float(t.height) / float(c.allocH), slices, c.levels);  // D4567-4568

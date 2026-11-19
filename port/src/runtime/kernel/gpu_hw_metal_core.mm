@@ -20,7 +20,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace ttt2_hw {
 
@@ -145,6 +148,13 @@ struct CoreState {
     id<MTLBuffer> readBuffer = nil;                                     // ReadTexture's staging (shared)
     SDL_Window* viewWindow = nullptr;                                   // the window metalView belongs to
     bool loggedNoDrawable = false, loggedFxaa = false, loggedCas = false, loggedMetalFx = false;
+    // ---- frame cost (D4961-5054 analogue). GPU times of the command buffers of one frame (= one present
+    // sequence number) fold into `frames` from the completed handlers (statsMutex); MaybeReportStats moves the
+    // frames that are >= 3 presents old into gpuFrameMs / gpuBusyMs (D3D11 reads its timestamps 3 frames later).
+    struct FrameGpu { double minStart = 0, maxEnd = 0, busy = 0; };
+    std::map<uint64_t, FrameGpu> frames;                       // frame number -> folded GPU times (statsMutex)
+    std::vector<float> gpuFrameMs, gpuBusyMs;                  // D4989 gpuFrameMs_ (cap 4096) + the busy sums (statsMutex)
+    uint64_t costCpNs = 0, costProcNs = 0;                     // D5030 costCpCycles_ / costProc100ns_ (non-Windows: ns)
 };
 CoreState& Core() { static CoreState* s = new CoreState; return *s; }   // leaked with the Backend (D5140)
 
@@ -333,6 +343,7 @@ bool Backend::Present(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* 
         if (!m.PresentTexture(source, logicalW, logicalH, swap)) return false;   // D1334
         m.lastSwap = swap;                                                       // D1335
         m.lastFront = source; m.lastFrontW = logicalW; m.lastFrontH = logicalH; // D1436
+        ++m.stats.presents;                                                      // D1451 (after a successful present)
         return true;
     }
 }
@@ -389,7 +400,24 @@ id<MTLCommandBuffer> Backend::Impl::Cmd()
     if (frameCmd) return frameCmd;
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     if (!cb) throw Failure("metal: commandBuffer returned nil");
+    // GPU time per frame: tag this buffer with the present sequence it belongs to (Present increments stats.presents
+    // after committing, so every buffer of one frame, the present pass included, carries the same number). The block
+    // captures values and the Impl pointer only (the Backend is leaked by Get(), so it outlives every handler).
+    Backend::Impl* const self = this;
+    const uint64_t frameNo = stats.presents;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status != MTLCommandBufferStatusError)
+        {
+            const double a = done.GPUStartTime, b = done.GPUEndTime;
+            if (b > a && a > 0)
+            {
+                std::lock_guard<std::mutex> lock(self->statsMutex);
+                auto ins = Core().frames.try_emplace(frameNo, CoreState::FrameGpu{ a, b, 0.0 });
+                CoreState::FrameGpu& f = ins.first->second;
+                if (!ins.second) { f.minStart = std::min(f.minStart, a); f.maxEnd = std::max(f.maxEnd, b); }
+                f.busy += b - a;
+            }
+        }
         if (done.status == MTLCommandBufferStatusError)
         {
             NSError* e = done.error;
@@ -569,6 +597,87 @@ bool Backend::Impl::ReadLogical(id<MTLTexture> tex, uint32_t logicalW, uint32_t 
         for (uint32_t& v : out) v = DisplayPixel(*this, v);                                      // D1483
         return true;
     }
+}
+
+// ================================================================ stats report (D5056-5097, D5033-5053)
+// Same printf formats as gpu_hw_d3d11.h, byte for byte, so bench/analizar*.py read both backends unchanged.
+// Counters Metal has no source for (compiles, shader_warm, pending skips, staged readbacks, gpu_vs_*, ring waits,
+// shadow skips) stay 0 and are still printed. The "pass breaks" line (D5091-5095) is not printed: no parser reads it.
+void Backend::Impl::MaybeReportStats()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastStats < std::chrono::seconds(5)) return;                                       // D5058
+    const double s = std::chrono::duration<double>(now - lastStats).count();                    // D5059
+    lastStats = now;                                                                            // D5060
+    const Stats d{ stats.draws - reported.draws, stats.triangles - reported.triangles,
+                   stats.skippedDraws - reported.skippedDraws, stats.emptyDraws - reported.emptyDraws,
+                   stats.resolves - reported.resolves, stats.depthResolves - reported.depthResolves,
+                   stats.writebacks - reported.writebacks, stats.stagedReadbacks - reported.stagedReadbacks,
+                   stats.presents - reported.presents,
+                   stats.compiles - reported.compiles, stats.diskHits - reported.diskHits,
+                   stats.warmHits - reported.warmHits, stats.pendingSkips - reported.pendingSkips,
+                   stats.uploads - reported.uploads, stats.uploadBytes - reported.uploadBytes,
+                   stats.resolvedHits - reported.resolvedHits, stats.depthHits - reported.depthHits,
+                   stats.gpuVsDraws - reported.gpuVsDraws, stats.vertexDataBytes - reported.vertexDataBytes,
+                   stats.ringWaits - reported.ringWaits, stats.ringWaitMs - reported.ringWaitMs,
+                   stats.resolveCreates - reported.resolveCreates, stats.resolvePoolHits - reported.resolvePoolHits,
+                   stats.shadowSkips - reported.shadowSkips };
+    reported = stats;                                                                           // D5076
+    if (d.shadowSkips) std::fprintf(stderr, "[gpu-hw]   shadows off: %llu shadow-map draws skipped\n", (unsigned long long)d.shadowSkips);   // D5078
+    std::fprintf(stderr,                                                                        // D5080-5090
+        "[gpu-hw] %.1fs: draws=%llu tris=%llu skipped=%llu empty=%llu resolves=%llu presents=%llu (%.1f/s) "
+        "ps_compiles=%llu ps_disk=%llu shader_warm=%llu shader_pending_skips=%llu tex_uploads=%llu (%.1f MB) resolved_hits=%llu writebacks=%llu (staged %llu) "
+        "depth_resolves=%llu depth_hits=%llu shaders=%zu textures=%zu gpu_vs_draws=%llu (%.1f MB vertex data, %zu vs) ring_waits=%llu (%.1f ms) resolve_textures=%llu new %llu reused\n",
+        s, (unsigned long long)d.draws, (unsigned long long)d.triangles, (unsigned long long)d.skippedDraws,
+        (unsigned long long)d.emptyDraws, (unsigned long long)d.resolves, (unsigned long long)d.presents,
+        double(d.presents) / s, (unsigned long long)d.compiles, (unsigned long long)d.diskHits, (unsigned long long)d.warmHits, (unsigned long long)d.pendingSkips,
+        (unsigned long long)d.uploads, double(d.uploadBytes) / 1048576.0, (unsigned long long)d.resolvedHits,
+        (unsigned long long)d.writebacks, (unsigned long long)d.stagedReadbacks, (unsigned long long)d.depthResolves, (unsigned long long)d.depthHits,
+        statShaders, statTextures, (unsigned long long)d.gpuVsDraws,
+        double(d.vertexDataBytes) / 1048576.0, statVertexShaders, (unsigned long long)d.ringWaits, d.ringWaitMs,
+        (unsigned long long)d.resolveCreates, (unsigned long long)d.resolvePoolHits);
+
+    // ---- frame cost (D5033-5053, non-Windows branch). CPU: the thread that calls (the command processor) and the
+    // whole process, per CLOCK_*_CPUTIME_ID.
+    CoreState& c = Core();
+    timespec cpTime{}, procTime{};
+    const bool haveCpu = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpTime) == 0 &&
+                         clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &procTime) == 0;
+    const uint64_t cp = uint64_t(cpTime.tv_sec) * 1000000000ull + uint64_t(cpTime.tv_nsec);
+    const uint64_t proc = uint64_t(procTime.tv_sec) * 1000000000ull + uint64_t(procTime.tv_nsec);
+    std::vector<float> gpuFrameMs, gpuBusyMs;
+    {
+        // Frames >= 3 presents old are complete (D3D11 reads the timestamp 3 frames later without waiting).
+        std::lock_guard<std::mutex> lock(statsMutex);
+        while (!c.frames.empty() && c.frames.begin()->first + 3 <= stats.presents)
+        {
+            const CoreState::FrameGpu& f = c.frames.begin()->second;
+            if (c.gpuFrameMs.size() < 4096) { c.gpuFrameMs.push_back(float((f.maxEnd - f.minStart) * 1000.0)); c.gpuBusyMs.push_back(float(f.busy * 1000.0)); }
+            c.frames.erase(c.frames.begin());
+        }
+        gpuFrameMs.swap(c.gpuFrameMs);
+        gpuBusyMs.swap(c.gpuBusyMs);
+    }
+    if (haveCpu && c.costCpNs && d.presents)
+    {
+        std::sort(gpuFrameMs.begin(), gpuFrameMs.end());
+        double sum = 0;
+        for (float value : gpuFrameMs) sum += value;
+        const size_t n = gpuFrameMs.size();
+        std::fprintf(stderr, "[gpu-hw]   frame cost: gpu %.2f ms between presents (median %.2f, p95 %.2f, max %.2f; %zu frames), "
+                     "cpu per frame: command processor %.2f ms; process %.2f cores\n",
+                     n ? sum / double(n) : 0.0, n ? gpuFrameMs[n / 2] : 0.0f, n ? gpuFrameMs[n * 95 / 100] : 0.0f,
+                     n ? gpuFrameMs[n - 1] : 0.0f, n, double(cp - c.costCpNs) / (1e6 * double(d.presents)),
+                     double(proc - c.costProcNs) / (s * 1e9));
+        std::sort(gpuBusyMs.begin(), gpuBusyMs.end());
+        double busySum = 0;
+        for (float value : gpuBusyMs) busySum += value;
+        const size_t nb = gpuBusyMs.size();
+        std::fprintf(stderr, "[gpu-metal]   gpu busy %.2f ms per frame (median %.2f; %zu frames)\n",
+                     nb ? busySum / double(nb) : 0.0, nb ? gpuBusyMs[nb / 2] : 0.0f, nb);
+    }
+    c.costCpNs = haveCpu ? cp : 0;
+    c.costProcNs = proc;
 }
 
 // ================================================================ test hooks (not used by gpu_render.cpp)

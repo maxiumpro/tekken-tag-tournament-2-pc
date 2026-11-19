@@ -202,7 +202,8 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
     const uint32_t left = std::min(Px(std::max(st.scX0, 0) * int(st.sampX), sc), attW);                 // D823
     const uint32_t top = std::min(Px(std::max(st.scY0, 0) * int(st.sampY), sc), attH);
     const uint32_t right = std::min(Px(double(x1), sc), attW), bottom = std::min(Px(double(y1), sc), attH);   // D824
-    if ((st.cull & 3) == 3) return;                                                                      // D828: both faces culled
+    if ((st.cull & 3) == 3) { ++m.stats.emptyDraws; return; }                                            // D828: both faces culled
+    m.stats.triangles += indexCount / 3;                                                                 // D855 (D3D11 counts them from here on, even for an empty scissor)
     if (right <= left || bottom <= top) return;               // empty scissor: draws nothing (as D3D11), no zero-size rect
 
     id<MTLRenderPipelineState> pipeline = m.Pipeline(ps, interps, colorTex ? colorTex.pixelFormat : MTLPixelFormatInvalid,
@@ -339,21 +340,22 @@ bool Backend::Draw(const uint32_t* regs, const std::vector<uint32_t>& psCode,
     @autoreleasepool {
         Impl& m = *impl_;
         m.Initialize();                                                                                  // D379
-        // D380 UpdateScale, D381 ShadowCaster: not in M1 (header comment).
+        // D380 UpdateScale, D381 ShadowCaster: not in M1 (header comment), so shadowSkips stays 0.
+        ++m.stats.draws;                                                                                 // D382
         MtlColorSurface& color = m.Color(st.colorBase);                                                  // D383
         color.touched = true;                                                                            // D385
         color.samplePitch = st.pitch * st.sampX;                                                         // D386
-        if (slots.empty()) return true;                                                                  // D387
+        if (slots.empty()) { ++m.stats.emptyDraws; return true; }                                        // D387
 
         const Impl::Ps* ps = m.PixelShader(psCode);                                                      // D389
-        if (!ps) return false;                                                                           // D390
+        if (!ps) { ++m.stats.skippedDraws; return false; }                                              // D390
 
         // ---- vertices: window space -> clip space for the sample-space viewport
         interps = std::min<uint32_t>(interps, 16);                                                       // D394
         const size_t stride = 16 + 16 * size_t(interps);                                                 // D395
         const size_t total = vertices.size();                                                            // D396
         const size_t vbBytes = total * stride, ibBytes = slots.size() * 4;                               // D397
-        if (vbBytes + stride > VertexRingBytes || ibBytes > IndexRingBytes) return false;                // D398
+        if (vbBytes + stride > VertexRingBytes || ibBytes > IndexRingBytes) { ++m.stats.skippedDraws; return false; }   // D398
         const Slice vb = Alloc(m, vbBytes);                                                              // D399-408 (arena, not a ring)
         const bool noClip = !st.depthClip;                                                               // D408
         for (size_t i = 0; i < total; ++i)                                                               // D409-418 (serial: no RasterPool)
@@ -381,6 +383,7 @@ bool Backend::Draw(const uint32_t* regs, const std::vector<uint32_t>& psCode,
         std::memcpy(ib.ptr, slots.data(), ibBytes);                                                      // D445
         // D450-456: fixed VS Passthrough(interps), TRIANGLELIST, R32_UINT - in the pipeline (Impl::Pipeline).
         PixelStageAndDraw(m, regs, *ps, color, st, vb, vbBytes, interps, ib, uint32_t(slots.size()), reachX, reachY);   // D457
+        m.MaybeReportStats();                                                                            // D856
         return true;                                                                                     // D458
     }
 }
