@@ -484,9 +484,19 @@ if(APPLE)
         # skin_profile.cpp needs SSSE3 as on Linux.
         target_compile_options(ttt2_mac_runtime PRIVATE -march=x86-64-v2)
     endif()
+    # R4 (PLAN-R4.md): TTT2_MAC_METAL=ON builds the own Metal backend (gpu_hw_metal.h) instead of D3D11 over
+    # DXVK. Only the hardware renderer moves: the D3D11 movie offload (gpu_d3d11_movie.h), and so DXVK and
+    # vkd3d-shader, stay linked until M6.
+    option(TTT2_MAC_METAL "R4: own Metal GPU backend instead of D3D11 over DXVK" OFF)
+    if(TTT2_MAC_METAL)
+        set(_ttt2_mac_gpu_backend TTT2_GPU_HW_METAL=1)
+    else()
+        set(_ttt2_mac_gpu_backend TTT2_GPU_HW_D3D11=1)
+    endif()
+    message(STATUS "GPU backend: ${_ttt2_mac_gpu_backend}")
     target_compile_definitions(ttt2_mac_runtime PRIVATE
         TTT2_HOST_GAME_UI=1 TTT2_LOCAL_SAVES=1 TTT2_HAVE_STEAM=${_ttt2_mac_have_steam}
-        TTT2_GPU_HW_BACKEND=1 TTT2_GPU_HW_D3D11=1 TTT2_D3D11_MOVIE_BACKEND=1)
+        TTT2_GPU_HW_BACKEND=1 ${_ttt2_mac_gpu_backend} TTT2_D3D11_MOVIE_BACKEND=1)
     if(TTT2_MAC_STEAM)
         target_include_directories(ttt2_mac_runtime PRIVATE "${TTT2_MAC_STEAMWORKS}/public")
     endif()
@@ -514,15 +524,34 @@ if(APPLE)
     add_executable(tekken_recomp_mac $<TARGET_OBJECTS:ttt2_mac_runtime> "${_ttt2_rt}/apple_import.mm")
     set_source_files_properties("${_ttt2_rt}/apple_import.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-O2")
     target_link_libraries(tekken_recomp_mac PRIVATE ttt2_setup_core "-framework AppKit")
-    # MetalFX at presentation (kernel/gpu_hw_metalfx.h): outside the runtime objects, so it gets
-    # neither the PPC overlay's forced include nor DXVK's Windows headers; the bundle's Vulkan
-    # headers have VK_EXT_metal_objects. MetalFX is weak: without it the bicubic path stays.
-    target_sources(tekken_recomp_mac PRIVATE "${_ttt2_rt}/kernel/gpu_hw_metalfx_mac.mm")
-    set_source_files_properties("${_ttt2_rt}/kernel/gpu_hw_metalfx_mac.mm" PROPERTIES
-        COMPILE_OPTIONS "-fobjc-arc;-O2"
-        INCLUDE_DIRECTORIES "${_ttt2_mac_install}/vulkan/include")
-    target_link_libraries(tekken_recomp_mac PRIVATE "-framework Foundation" "-framework Metal"
-        "-weak_framework MetalFX")
+    if(TTT2_MAC_METAL)
+        # R4 Metal backend (gpu_hw_metal_*.mm): outside the runtime objects, like the MetalFX hook below, so
+        # it gets neither the PPC overlay's forced include nor DXVK's Windows headers. Same -O2 and
+        # -ffp-contract=off as the runtime (the inline helpers it shares with gpu_render.cpp, e.g.
+        # ConvertCpuVertex, then compile alike). gpu_hw_metalfx_mac.mm is not built: its hook works on DXVK
+        # textures and only gpu_hw_d3d11.h calls it.
+        set(_ttt2_metal_sources)
+        foreach(_part core shaders draw textures surfaces stubs)
+            list(APPEND _ttt2_metal_sources "${_ttt2_rt}/kernel/gpu_hw_metal_${_part}.mm")
+        endforeach()
+        target_sources(tekken_recomp_mac PRIVATE ${_ttt2_metal_sources})
+        set_source_files_properties(${_ttt2_metal_sources} PROPERTIES
+            COMPILE_OPTIONS "-fobjc-arc;-O2;-ffp-contract=off"
+            INCLUDE_DIRECTORIES "${_ttt2_rt};${_ttt2_rt}/kernel")
+        set_target_properties(tekken_recomp_mac PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON)
+        target_link_libraries(tekken_recomp_mac PRIVATE "-framework Foundation" "-framework Metal"
+            "-framework QuartzCore")
+    else()
+        # MetalFX at presentation (kernel/gpu_hw_metalfx.h): outside the runtime objects, so it gets
+        # neither the PPC overlay's forced include nor DXVK's Windows headers; the bundle's Vulkan
+        # headers have VK_EXT_metal_objects. MetalFX is weak: without it the bicubic path stays.
+        target_sources(tekken_recomp_mac PRIVATE "${_ttt2_rt}/kernel/gpu_hw_metalfx_mac.mm")
+        set_source_files_properties("${_ttt2_rt}/kernel/gpu_hw_metalfx_mac.mm" PROPERTIES
+            COMPILE_OPTIONS "-fobjc-arc;-O2"
+            INCLUDE_DIRECTORIES "${_ttt2_mac_install}/vulkan/include")
+        target_link_libraries(tekken_recomp_mac PRIVATE "-framework Foundation" "-framework Metal"
+            "-weak_framework MetalFX")
+    endif()
     # The runtime's overrides (strong sub_X) beat the archive's PPC_WEAK_FUNC
     # wrappers: XenonRecomp emits wrappers, not aliases, on Apple.
     target_link_libraries(tekken_recomp_mac PRIVATE ttt2_mac_ppc ttt2_ffmpeg SDL3::SDL3
