@@ -188,6 +188,44 @@ struct Backend::Impl {
     // blend / write mask exactly as Pipeline(ps, interps, ...).
     id<MTLRenderPipelineState> Pipeline(const Vs& vs, const Ps& ps, MTLPixelFormat color, MTLPixelFormat depth,
                                         uint32_t blend, uint32_t writeMask);
+
+    // ===== readback (surfaces.mm) — M2c =====
+    // Staged CPU readback of resolves (D1068-1190, D4674-4791) without blocking the CPU: a resolve's copy goes to a
+    // shared buffer on frameCmd, frameCmd is committed at once (Submit(false) = the D4705 Flush), and a CPU fence fed
+    // by that command buffer's completed handler says when it landed. The scatter into guest memory always runs under
+    // g_backendMutex, after the fence passed (D1126-1150, D4766-4786). Everything here is under the lock except
+    // ReadbackFence's own fields (completed handlers on a Metal thread; the PendingCopyWaiter function, lock-free).
+    struct ReadbackFence;                            // surfaces.mm: mutex + condvar + done / failed (D3D11 readbackFence_)
+    // The D2139-2163 Resolved fields MtlResolved has no room for, one per resolve destination (and one per small
+    // snapshot). Reset whenever Resolve makes a new texture for the destination (D976 r = Resolved{}).
+    struct Readback {
+        id<MTLBuffer> staging = nil;                 // shared, pitch * height * 4 B, tight rows (D4693-4699 r.staging)
+        bool staged = false;                         // a copy to `staging` is queued (D2154)
+        uint64_t stagedSeq = 0;                      // the resolve's seq when it was queued (D2155)
+        uint64_t stagedFence = 0;                    // fence value reached once the copy landed (D2157)
+        std::chrono::steady_clock::time_point stagedAt{};   // D2156
+        uint64_t generation = 0, cpuReadSerial = 0;  // D2143 (generation: a new resolve texture, D4178)
+        std::vector<uint32_t> pixels;                // D2161 readbackPixels (logical size, tight rows)
+        std::vector<uint32_t> tiledToLinear;         // D2162 (BuildResolvedTileLookup, once per resolve shape)
+    };
+    std::unordered_map<uint32_t, Readback> readbacks;   // key = dest (as `resolved`)
+    // D4711-4713 smallReadbacks_ / smallPending_: a snapshot of a tiny resolve owning its own staging copy until
+    // FinishSmallWritebacks consumes it; `pending` replaces the smallPending_ set.
+    struct SmallReadback { MtlResolved r; Readback rb; bool pending = false; };
+    std::unordered_map<uint32_t, SmallReadback> smallReadbacks;   // key = dest
+    std::shared_ptr<ReadbackFence> readbackFence;    // made at the first staged copy
+    uint64_t readbackFenceValue = 0;                 // D3D11 readbackFenceValue_: last value handed to a copy
+    uint64_t pendingFence = 0;                       // D3D11 pendingFence_: what PendingCopyWaiter waits for
+    // D4674-4710: resample (scaled) + copy to rb.staging on frameCmd, fence value, Submit(false); stagedReadbacks++.
+    void StageReadback(MtlResolved& r, Readback& rb);
+    // D4845-4860: the staged copy into `out` (width * height words). noWait: false while the copy has not landed;
+    // otherwise waits. Throws if the copy's command buffer failed.
+    bool ReadStaging(const Readback& rb, uint32_t width, uint32_t height, std::vector<uint32_t>& out, bool noWait);
+    void CancelOverlappingSmallReadbacks(uint32_t dest, uint32_t size);              // D4716-4728
+    void StageSmallReadback(uint32_t dest, const MtlResolved& r, const Readback& rb); // D4729-4748
+    // D4749-4791: scatter the small copies that landed. Resolve calls it (D957); D3D11 also calls it at Present
+    // (D1265): here FrontTexture does, at its top (core.mm's Present calls FrontTexture).
+    void FinishSmallWritebacks();
 };
 
 // Test hook (core): lets a harness without the game show a texture through the real present path.
