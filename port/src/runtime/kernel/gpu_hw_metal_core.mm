@@ -170,7 +170,7 @@ void ThrowPendingCommandError()
         throw Failure("metal: a command buffer failed on the GPU (error " + std::to_string(g_lastCommandError.load()) + ")");
 }
 
-id<MTLRenderPipelineState> Pipeline(id<MTLDevice> device, id<MTLLibrary> lib, NSString* fs)
+id<MTLRenderPipelineState> CorePipeline(id<MTLDevice> device, id<MTLLibrary> lib, NSString* fs)
 {
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"present_vs"];
@@ -364,13 +364,13 @@ void Backend::Impl::Initialize()
         if (!lib) throw Failure("metal: core shaders did not compile: " + Describe(err));
         CoreState& c = Core();
         c.library = lib;
-        c.display[0] = Pipeline(dev, lib, @"display_0");
-        c.display[1] = Pipeline(dev, lib, @"display_1");
-        c.display[2] = Pipeline(dev, lib, @"display_2");
-        c.display[3] = Pipeline(dev, lib, @"display_3");
-        c.scale = Pipeline(dev, lib, @"scale_ps");
-        c.resampleLinear = Pipeline(dev, lib, @"resample_linear");
-        c.resamplePoint = Pipeline(dev, lib, @"resample_point");
+        c.display[0] = CorePipeline(dev, lib, @"display_0");
+        c.display[1] = CorePipeline(dev, lib, @"display_1");
+        c.display[2] = CorePipeline(dev, lib, @"display_2");
+        c.display[3] = CorePipeline(dev, lib, @"display_3");
+        c.scale = CorePipeline(dev, lib, @"scale_ps");
+        c.resampleLinear = CorePipeline(dev, lib, @"resample_linear");
+        c.resamplePoint = CorePipeline(dev, lib, @"resample_point");
         // D3948: TTT2_RENDER_SCALE, clamped to [1, 4] off Android; slice 1 has no settings-driven scale.
         if (const char* e = std::getenv("TTT2_RENDER_SCALE"); e && *e)
             scale = std::clamp(float(std::atof(e)), 1.0f, 4.0f);
@@ -453,7 +453,7 @@ void Backend::Impl::UpdateGamma(const uint32_t* ramp, uint32_t version)
     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
                                                                                  width:256 height:1 mipmapped:NO];
     d.usage = MTLTextureUsageShaderRead;
-    d.storageMode = MTLStorageModeManaged;   // CPU-writable (replaceRegion); never Private
+    d.storageMode = MTLStorageModeShared;    // CPU-writable (replaceRegion); Managed is deprecated on Apple silicon
     id<MTLTexture> lut = [device newTextureWithDescriptor:d];
     if (!lut) throw Failure("metal: gamma LUT texture");
     [lut replaceRegion:MTLRegionMake2D(0, 0, 256, 1) mipmapLevel:0 withBytes:table bytesPerRow:sizeof(table)];
