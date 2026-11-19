@@ -18,8 +18,8 @@
 //
 // Shader binding (m0/duelo/BINDINGS.md): fragment function "shader_main"; buffer(0) = cbuffer table (one
 // 64-bit gpuAddress per declared cb, ascending register: cb0 = XenosPsConstants 4096 B, cb1 = XenosPsState =
-// PsStateCB 1712 B); buffer(1) = argument table, dense, field order from the .bind sidecar written at
-// conversion time from airconv's SM50GetArgumentsInfo (never from a formula). Today's corpus: per declared
+// PsStateCB 1712 B); buffer(1) = argument table, dense, field order and byte offsets from the
+// ps_<KEY>.layout.tsv sidecar written at conversion time (m0/duelo/layout.py on airconv -S; never from a formula). Today's corpus: per declared
 // sampler N, 3 qwords {sN, cube_sN, meta_sN = lod-bias float bits}; then per declared SRV N, 2 qwords
 // {tN, meta_tN = (arrayLength << 32) | minLOD float bits}. PS input TEXCOORDn -> user(reg{n+1}_0); the fixed VS
 // writes all 16. Every texture, buffer and sampler reached through a table needs useResource:usage:stages:.

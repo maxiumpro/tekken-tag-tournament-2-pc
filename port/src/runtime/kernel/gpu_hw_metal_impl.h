@@ -63,7 +63,7 @@ struct Backend::Impl {
     // 1280x720 BGRX of `tex` resampled at logical pixel centres (D4886-4903), then DisplayPixel (D1488-1495).
     bool ReadLogical(id<MTLTexture> tex, uint32_t logicalW, uint32_t logicalH, std::vector<uint32_t>& out);
 
-    // ===== surfaces (gpu_hw_metal_surfaces.mm) — slice 4; slice 1 stubs live in core =====
+    // ===== surfaces (gpu_hw_metal_surfaces.mm) — slice 4; slice 1 stubs live in gpu_hw_metal_stubs.mm =====
     std::unordered_map<uint32_t, MtlColorSurface> colors;     // key = colorBase (base | fmt << 12), D2888
     std::unordered_map<uint32_t, MtlDepthSurface> depths;     // key = depthBase, D2889
     std::unordered_map<uint32_t, MtlResolved> resolved;       // key = dest guest address, D2890
@@ -71,11 +71,49 @@ struct Backend::Impl {
     // texture decoded from guest memory (storedSwap = true). nil = nothing to show.
     id<MTLTexture> FrontTexture(uint32_t fb, bool& storedSwap, uint32_t& logicalW, uint32_t& logicalH);
 
-    // ===== later slices (frozen when their brief goes out) =====
-    // shaders  (gpu_hw_metal_shaders.mm): PS cache by Fnv(PixelShaderHlsl(generic)) text key -> ps_<KEY>.metallib
-    //          + ps_<KEY>.layout.tsv (m0/duelo/layout.py format); fixed CPU-vertex VS; pipeline cache.
-    // textures (gpu_hw_metal_textures.mm): BindTexture (D4443-4569), samplers (D202-239).
-    // draw     (gpu_hw_metal_draw.mm): Draw / PixelStageAndDraw (D375-857), states (D4216-4339), encoders.
+    // ===== draw (gpu_hw_metal_draw.mm) — slice 2 =====
+    // ONE render encoder may be open on frameCmd at a time. Every file that opens any other encoder (render,
+    // blit) or commits frameCmd calls EndPass() first (core: Pass, ReadLogical, Submit). A pass reopened on a
+    // target drawn earlier in the frame must LOAD, never clear.
+    id<MTLRenderCommandEncoder> renderEnc = nil;
+    id<MTLTexture> encColor = nil, encDepth = nil;   // targets of renderEnc (nil = none)
+    void EndPass();                                  // ends renderEnc if open; idempotent
+    // Test visibility: the exact bytes the last Draw bound as cb0 (first constantRows * 16 B) and cb1 (PsStateCB).
+    std::vector<uint8_t> lastCb0, lastCb1;
+
+    // ===== shaders (gpu_hw_metal_shaders.mm) — slice 2 =====
+    struct ArgField { std::string type, name; uint32_t offset; };        // one row of layout.tsv, binding_table
+    struct Ps {
+        uint64_t textKey = 0;                        // Fnv(PixelShaderHlsl(generic)) = ps_<KEY> (D3417)
+        id<MTLFunction> fn = nil;                    // "shader_main"
+        std::vector<ArgField> args;                  // binding_table fields in offset order
+        uint32_t argBytes = 0, cbCount = 0;          // binding_table size; cbuffer_table entries (cb0, cb1)
+        uint32_t slots = 0, cubeSlots = 0, constantRows = 0;   // from the translation (D2892-2904)
+        bool failed = false;
+    };
+    // Generic variant only in M1 (Depth / ResolvedColor / no-discard / texture-state variants: M3). Directory:
+    // $TTT2_METAL_CACHE, else <shader cache dir>/metal. A miss logs "[gpu-metal] ps cache miss <KEY>" once per
+    // key, counts it, and returns nullptr (Draw returns false, as D3D11 when a PS is not ready, D390).
+    const Ps* PixelShader(const std::vector<uint32_t>& code);
+    // Pipeline for (ps, interps, colour format or Invalid, depth format or Invalid, blend word, writeMask).
+    id<MTLRenderPipelineState> Pipeline(const Ps& ps, uint32_t interps, MTLPixelFormat color, MTLPixelFormat depth,
+                                        uint32_t blend, uint32_t writeMask);
+    id<MTLDepthStencilState> DepthState(const DrawState& st);           // D4305-4339
+
+    // ===== textures (gpu_hw_metal_textures.mm) — slice 3; the slice-2 harness provides its own =====
+    struct Bound { id<MTLTexture> tex = nil; uint32_t swizzle = 0x688, mode = 0, width = 1, height = 1;
+                   float scaleX = 1, scaleY = 1; uint32_t slices = 1, levels = 1; uint64_t mip = 0; };   // D2197 (+ MipSampling)
+    Bound BindTexture(const uint32_t* regs, uint32_t slot, bool array);  // D4443-4569
+    // Sampler for a slot (the slot is only a harness hook; the real one keys on info + mip, D2673-2685).
+    // The three airconv fields: sN, cube_sN (D2 clamp variant, BINDINGS.md), meta_sN = LOD-bias float bits.
+    struct SamplerSet { id<MTLSamplerState> s = nil, cube = nil; float lodBias = 0; };
+    SamplerSet Sampler(uint32_t slot, const uint32_t info[4], uint64_t mip);
+
+    // ===== surfaces (gpu_hw_metal_surfaces.mm) — slice 4; the slice-2 harness provides its own =====
+    MtlColorSurface& Color(uint32_t key);                                // D3858-3863
+    MtlDepthSurface& Depth(uint32_t base);                               // D3865
+    void Grow(MtlColorSurface& s, uint32_t key, uint32_t w, uint32_t h, float scale);   // D4027-4047
+    void Grow(MtlDepthSurface& s, uint32_t base, uint32_t w, uint32_t h, float scale);  // D4048-4063
 };
 
 // Test hook (core): lets a harness without the game show a texture through the real present path.
