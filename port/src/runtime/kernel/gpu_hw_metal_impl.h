@@ -85,9 +85,10 @@ struct Backend::Impl {
     std::chrono::steady_clock::time_point lastStats = std::chrono::steady_clock::now();
     // Called at the end of Draw and Resolve (D856, D1090): every >= 5 s prints the D5080 "[gpu-hw] %.1fs: draws=..."
     // line byte-compatible with D3D11, then the D5044 non-Windows "frame cost:" line. GPU ms per frame = span from
-    // the first GPUStartTime to the last GPUEndTime of the command buffers committed between two presents (the
-    // Metal analogue of D3D11's present-to-present timestamps: includes gaps, an upper bound of busy time); plus a
-    // "[gpu-metal]   gpu busy" line with the summed (GPUEndTime - GPUStartTime).
+    // the first GPUStartTime to the last GPUEndTime of the command buffers committed between two presents; plus a
+    // "[gpu-metal]   gpu busy" line with the summed (GPUEndTime - GPUStartTime). NOT the same quantity as D3D11's
+    // (DXVK submits several times per frame and its span includes GPU waits for the CPU, up to the whole frame when
+    // CPU-bound; M1 commits ~once per frame, so span ~= busy). Compare backends on this number only when GPU-bound.
     void MaybeReportStats();
     // Submit/Cmd tag each command buffer with the present sequence it belongs to; the completed handler folds its
     // GPU times into that frame (handler thread: under statsMutex only).
