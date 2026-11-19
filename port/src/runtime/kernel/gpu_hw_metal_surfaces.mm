@@ -20,13 +20,11 @@
 //   D4759 sourceDepth: D3D11 never sets it (always ~0u), so the comparison is always equal.
 //   lastStagedAgeMs_ / lastMapWaitMs_, frame_pacing_probe, writebackCauses_: diagnostics.
 //
-// Not ported in M1 (each named):
-//   UpdateScale / Rescale (D956, D3960-3973, D4123-4157): core fixes the render scale at Initialize.
-//   Native-size bake surfaces (D784-813, D3877-3935, D992-997 resolveDests_/UpdateNative, D1110-1117): M2.
-//   Shadow-map skipping (D962 NoteShadowResolve, D1009-1013 ShadowMapOff, D2201-2244): M2; depth resolves
-//     always copy the surface.
-//   HW toggles (D1007 / D1047 toggle_ & 4, D1085 toggle_ & 8), census / scale logs (D983-991, D999-1002),
-//     stats_.*: diagnostics.
+// M2c parte 2 (impl.h "scale / native / shadow"): UpdateScale / RequestedScale / Rescale (D956, D3937-3973,
+// D4123-4157), native-size bake surfaces (D3877-3935 UpdateNative, D992-997 resolveDests_, D1110-1117), shadow-map
+// skipping (D962 NoteShadowResolve, D1009-1013 ShadowMapOff, D2201-2244). Not ported (each named):
+//   ScaleOverride (D3936, D4376-4392 TTT2_IMAGE_TOGGLE): a diagnostic; the scale file covers the live switch.
+//   HW toggles (D1007 / D1047 toggle_ & 4, D1085 toggle_ & 8), census logs (D999-1002), stats_.*: diagnostics.
 //
 // State the frozen Impl has no fields for lives in SurfaceState below (one Backend exists, Get()).
 // Game symbols: g_base (kernel_shared.h, declared here directly: that header pulls in the PPC headers),
@@ -38,6 +36,7 @@
 #include "gpu_hw_dirty_tracker.h"
 #include "gpu_hw_texture_upload.h"
 #include "gpu_hw_writeback.h"
+#include "display_settings.h"
 
 #import <Foundation/Foundation.h>
 
@@ -48,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -152,6 +152,8 @@ struct SurfaceState {
     // D2139-2163 fields MtlResolved does not carry: readbackHot (the CPU read this destination before), kept
     // across texture re-creation (D975-979); resolveRevision_ (D2930).
     std::unordered_set<uint32_t> readbackHot;
+    // D3884 resolveDests_: colour key -> dest -> CPU-read (readbackHot of that dest when last seen), UpdateNative's input.
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, bool>> resolveDests;
     uint64_t resolveRevision = 0;
     uint64_t resolveGeneration = 0;                                     // D2930 resolveGeneration_ (D4178)
     // The logical-size target of a scaled resolve's readback (D4680-4689 r.logical), one per shape here, shared by
@@ -462,6 +464,39 @@ bool WaitFence(Impl::ReadbackFence& f, uint64_t value, std::chrono::milliseconds
     return !f.failed && f.done >= value;
 }
 
+// D3937-3958 RequestedScale (Apple branch; ScaleOverride / TTT2_IMAGE_TOGGLE not ported, header).
+float RequestedScale()
+{
+    if (const char* path = std::getenv("TTT2_RENDER_SCALE_FILE"); path && *path)                 // D3941: live scale file
+    {
+        float value = 0.0f;
+        if (std::ifstream file(path); file && file >> value && std::isfinite(value))            // D3944
+            return std::clamp(value, 0.5f, 4.0f);                                                // D3945
+    }
+    if (const char* e = std::getenv("TTT2_RENDER_SCALE"); e && *e)                               // D3948
+        return std::clamp(float(std::atof(e)), 1.0f, 4.0f);                                      // D3953 (non-Android)
+    const display_settings::Resolution r = display_settings::GetResolution();                    // D3956
+    return std::clamp(std::min(float(r.width) / 1280.0f, float(r.height) / 720.0f), 0.5f, 4.0f); // D3957
+}
+
+// D3887-3891
+bool NativeReadbackOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_NATIVE_READBACK"); return !(e && *e == '0'); }();
+    return on;
+}
+
+// D4204-4214 SurfaceMegabytes (for the Rescale log).
+double SurfaceMegabytes(const Impl& m)
+{
+    auto bpp = [](MTLPixelFormat f) { return f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRG32Float ? 8.0 : 4.0; };   // D4206-4208
+    double bytes = 0;
+    for (const auto& [k, c] : m.colors) if (c.tex) bytes += double(AllocPx(c.extW, c.scale)) * AllocPx(c.extH, c.scale) * bpp(c.format);   // D4210
+    for (const auto& [k, d] : m.depths) if (d.tex) bytes += double(AllocPx(d.extW, d.scale)) * AllocPx(d.extH, d.scale) * 8.0;            // D4211
+    for (const auto& [k, r] : m.resolved) if (r.tex) bytes += double(AllocPx(r.pitch, r.scale)) * AllocPx(r.height, r.scale) * 4.0;       // D4212
+    return bytes / 1048576.0;                                                                    // D4213
+}
+
 } // namespace
 
 // ================================================================ Backend::Impl (surfaces section)
@@ -765,6 +800,140 @@ id<MTLTexture> Backend::Impl::FrontTexture(uint32_t fb, bool& storedSwap, uint32
     return st.cpuFront;                                                                            // D4938
 }
 
+// ================================================================ Backend::Impl (scale / native / shadow, M2c parte 2)
+// D3960-3973: follow the RESOLUTION setting (once per settings generation) and, on Apple, the scale file (polled
+// every 1 s even when the generation did not move).
+void Backend::Impl::UpdateScale()
+{
+    const uint32_t g = display_settings::Generation();                                             // D3962
+    const auto now = std::chrono::steady_clock::now();                                             // D3964
+    if (g == scaleGeneration && now < nextScalePoll) return;                                       // D3965
+    nextScalePoll = now + std::chrono::seconds(1);                                                 // D3966
+    scaleGeneration = g;                                                                           // D3970
+    const float s = RequestedScale();                                                              // D3971
+    if (s != scale) Rescale(s);                                                                    // D3972
+}
+
+// D4123-4157. Colour and depth surfaces go through Grow at their own extent: its other-scale branch is exactly
+// D4131-4145 (new texture, clear, resample of the old content over AllocPx(ext, k), filterable formats linear,
+// depth through the fragment depth). Resolve textures: a new one at `s` (pool or new, D4176-4203), cleared and
+// resampled from the old one.
+void Backend::Impl::Rescale(float s)
+{
+    @autoreleasepool {
+        Initialize();
+        EndPass();                                                    // every resample below is an encoder of its own
+        const float old = scale;                                                                   // D4125
+        scale = s;                                                                                 // D4126
+        for (auto& [key, c] : colors)                                                              // D4127
+        {
+            const float k = nativeColors.count(key) ? 1.0f : s;                                    // D4129
+            if (!c.tex || c.scale == k) continue;                                                  // D4130
+            Grow(c, key, c.extW, c.extH, k);                                                       // D4131-4135
+        }
+        for (auto& [key, d] : depths)                                                              // D4136
+        {
+            const float k = nativeDepths.count(key) ? 1.0f : s;                                    // D4138
+            if (!d.tex || d.scale == k) continue;                                                  // D4139
+            Grow(d, key, d.extW, d.extH, k);                                                       // D4140-4144
+        }
+        for (auto& [dest, r] : resolved)                                                           // D4145
+        {
+            if (!r.tex || r.scale != old) continue;                                                // D4147: native-size resolves stay at 1
+            __strong id<MTLTexture> src = r.tex;                                                   // D4148 (MakeResolved drops r.tex)
+            MakeResolved(*this, r, s);                                                             // D4149
+            readbacks[dest].generation = ++St().resolveGeneration;                                 // D4178 (inside MakeResolvedTexture)
+            const uint32_t w = AllocPx(r.pitch, s), h = AllocPx(r.height, s);
+            ResampleColor(*this, src, r.tex, MTLLoadActionClear, w, h, 1.0f / float(w), 1.0f / float(h), !r.depth,
+                          "resolve rescale");                                                      // D4150-4151 (D4200-4201 clear)
+        }
+        lastFront = nil;                                                                           // D4153
+        St().resolvePool.clear();                                                                  // D4154: sized for the old scale
+        std::fprintf(stderr, "[gpu-hw] render scale %.2f -> %.2f (%zu colour, %zu depth surfaces, %zu resolved textures resampled; %.0f MB)\n",
+                     double(old), double(s), colors.size(), depths.size(), resolved.size(), SurfaceMegabytes(*this));   // D4155-4156
+    }
+}
+
+// D3894-3935: re-evaluate colour surface `key` after its resolves changed (a new destination, or one the CPU read).
+void Backend::Impl::UpdateNative(uint32_t key)
+{
+    if (!NativeReadbackOn() || key == ~0u) return;                                                 // D3896
+    SurfaceState& sst = St();
+    auto it = sst.resolveDests.find(key);                                                          // D3897
+    bool cpuOnly = false;                                                                          // D3902
+    uint32_t bakePitch = 0;                                                                        // D3903
+    const auto surface = colors.find(key);                                                         // D3904
+    if (it != sst.resolveDests.end() && surface != colors.end() && surface->second.extW <= 1024 && surface->second.extH <= 1024)   // D3905
+        for (const auto& [dest, cpu] : it->second)                                                 // D3906
+        {
+            const auto r = resolved.find(dest);                                                    // D3908
+            if (cpu && r != resolved.end() && r->second.pitch == r->second.height && r->second.pitch >= 256 &&
+                (r->second.pitch & (r->second.pitch - 1)) == 0)                                    // D3909-3910
+            {
+                cpuOnly = true;                                                                    // D3912
+                bakePitch = r->second.sourcePitch;                                                 // D3913
+            }
+        }
+    const bool was = nativeColors.count(key) != 0;                                                 // D3916
+    if (cpuOnly == was) return;                                                                    // D3917
+    const auto d = depthWithColor.find(key);                                                       // D3918
+    if (cpuOnly)                                                                                   // D3919
+    {
+        const uint32_t pitch = bakePitch ? bakePitch : surface->second.samplePitch;                // D3921
+        nativeColors[key] = pitch;                                                                 // D3922
+        if (d != depthWithColor.end()) nativeDepths[d->second] = pitch;                            // D3923
+    }
+    else
+    {
+        nativeColors.erase(key);                                                                   // D3927
+        if (d != depthWithColor.end()) nativeDepths.erase(d->second);                              // D3928
+    }
+    static int logged = 0;                                                                         // D3930-3934
+    if (logged++ < 32)
+        std::fprintf(stderr, "[gpu-hw] colour surface %05X (depth %03X) now renders at %s (%s)\n", key,
+                     d != depthWithColor.end() ? d->second : 0xFFFu, cpuOnly ? "native size" : "the render scale",
+                     cpuOnly ? "a texture bake the CPU reads back" : "no longer a texture bake");
+}
+
+// D2211-2227: a square 512 / 1024 / 2048 depth resolve names a shadow map's depth surface.
+void Backend::Impl::NoteShadowResolve(uint32_t depthBase, uint32_t pitch, uint32_t height)
+{
+    if (pitch != height || (pitch != 512 && pitch != 1024 && pitch != 2048)) return;               // D2213
+    ShadowSurface* slot = nullptr;                                                                 // D2214
+    for (ShadowSurface& e : shadowSurfaces)                                                        // D2215
+        if (e.size && e.base == depthBase && e.size == pitch) { slot = &e; break; }                // D2216
+    if (!slot)                                                                                     // D2217
+    {
+        slot = &shadowSurfaces[0];                                                                 // D2219
+        for (ShadowSurface& e : shadowSurfaces) if (e.seen < slot->seen) slot = &e;                // D2220: the oldest (or a free one)
+        if (!slot->size || slot->base != depthBase)                                                // D2221
+            std::fprintf(stderr, "[gpu-hw] shadow map: depth surface %03X, %ux%u\n", depthBase, pitch, pitch);   // D2222
+        slot->base = depthBase;                                                                    // D2223
+        slot->size = pitch;                                                                        // D2224
+    }
+    slot->seen = stats.presents + 1;                                                               // D2226
+}
+
+// D2230-2236: SHADOWS OFF and `depthBase` is a known square map: its resolve writes 0.0 (no occluder).
+bool Backend::Impl::ShadowMapOff(uint32_t depthBase, uint32_t pitch, uint32_t height) const
+{
+    if (display_settings::GetShadows() || pitch != height) return false;                          // D2232
+    for (const ShadowSurface& e : shadowSurfaces)                                                  // D2233
+        if (e.size == pitch && e.base == depthBase) return true;                                   // D2234
+    return false;                                                                                  // D2235
+}
+
+// D2237-2244: a caster - a depth-only draw writing depth with a real compare into a shadow map's surface (pitch
+// the map's size or up to 64 more), resolved in the last 600 presents (~10 s).
+bool Backend::Impl::ShadowCaster(const DrawState& st) const
+{
+    if (st.writeMask || !st.zEnable || !st.zWrite || st.zFunc == 7 || display_settings::GetShadows()) return false;   // D2239
+    for (const ShadowSurface& e : shadowSurfaces)                                                  // D2240
+        if (e.size && e.base == st.depthBase && st.pitch >= e.size && st.pitch <= e.size + 64 && stats.presents < e.seen + 600)   // D2241
+            return true;                                                                           // D2242
+    return false;                                                                                  // D2243
+}
+
 // ================================================================ Backend (public, surfaces part)
 // D952-1091. srcSelect 0-3 colour, 4 depth; destFormat 31 (16_16_FLOAT) keeps red / green as halves, every
 // other colour destination is 8_8_8_8 (D945-951).
@@ -774,13 +943,13 @@ void Backend::Resolve(uint32_t colorBase, uint32_t dest, uint32_t pitch, uint32_
     @autoreleasepool {
         Impl& m = *impl_;
         m.Initialize();                                                                            // D955
-        // D956 UpdateScale: not in M1 (header).
+        m.UpdateScale();                                                                           // D956
         m.FinishSmallWritebacks();                                                                 // D957
         m.CancelOverlappingSmallReadbacks(dest, ResolveBytes(pitch, height));                      // D958
         ++m.stats.resolves;                                                                        // D959
         const bool depth = srcSelect == 4;                                                         // D960
         const bool rg16f = !depth && destFormat == 31;                                             // D961
-        // D962 NoteShadowResolve: shadow-map skipping is not in M1.
+        if (depth) m.NoteShadowResolve(depthBase, pitch, height);                                  // D962
         MtlResolved& r = m.resolved[dest];                                                         // D963
         float sourceScale = m.scale;                                                               // D964
         if (depth)                                                                                 // D965-969
@@ -807,7 +976,27 @@ void Backend::Resolve(uint32_t colorBase, uint32_t dest, uint32_t pitch, uint32_
         }
         r.sourceKey = depth ? ~0u : colorBase;                                                     // D981
         if (!depth) { const auto c = m.colors.find(colorBase); r.sourcePitch = c != m.colors.end() ? c->second.samplePitch : 0; }   // D982
-        // D992-997 resolveDests_ / UpdateNative: native-size surfaces are not in M1.
+        static const bool scaleLog = [] { const char* e = std::getenv("TTT2_RESOLVE_SCALE_LOG"); return e && *e == '1'; }();   // D983
+        if (scaleLog)                                                                              // D984-991 (one line per shape)
+        {
+            static std::unordered_set<uint64_t> seen;
+            const uint64_t shape = (uint64_t(colorBase) << 32) ^ (uint64_t(dest) >> 4) ^ (uint64_t(pitch) << 44) ^ (uint64_t(height) << 20);
+            if (seen.insert(shape).second)
+            {
+                const auto c = m.colors.find(colorBase);
+                std::fprintf(stderr, "[resolve-scale] %s %05X/%03X %ux%u -> %08X: source scale %.2f, texture scale %.2f, surface ext %ux%u native %d/%d\n",
+                             depth ? "depth" : "colour", colorBase, depthBase, pitch, height, dest, double(sourceScale), double(r.scale),
+                             c != m.colors.end() ? c->second.extW : 0u, c != m.colors.end() ? c->second.extH : 0u,
+                             int(m.nativeColors.count(colorBase)), int(m.nativeDepths.count(depthBase)));
+            }
+        }
+        if (!depth)                                                                                // D992
+        {
+            auto& dests = St().resolveDests[colorBase];                                            // D994
+            const bool hot = IsHot(dest);                                                          // r.readbackHot (SurfaceState)
+            auto [entry, added] = dests.try_emplace(dest, hot);                                    // D995
+            if (added || entry->second != hot) { entry->second = hot; m.UpdateNative(colorBase); } // D996
+        }
         r.depthFloat = depthFloat;                                                                 // D998
         m.EndPass();                                                    // every fill below is an encoder of its own
         const MTLLoadAction load = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -817,8 +1006,9 @@ void Backend::Resolve(uint32_t colorBase, uint32_t dest, uint32_t pitch, uint32_
         {
             ++m.stats.depthResolves;                                                               // D1006
             auto d = m.depths.find(depthBase);                                                     // D1007
-            // D1009-1013 (shadow map off -> 0): not in M1.
-            if (d != m.depths.end() && d->second.touched && d->second.tex)                         // D1014: BlitDepth (D2745-2783)
+            if (m.ShadowMapOff(depthBase, pitch, height))                                          // D1009
+                ClearPass(m, r.tex, nil, zero, "shadow map off");          // D1011-1012: SHADOWS OFF, no occluder anywhere (0.0)
+            else if (d != m.depths.end() && d->second.touched && d->second.tex)                    // D1014: BlitDepth (D2745-2783)
             {
                 MtlDepthSurface& s = d->second;
                 const uint32_t sx = std::clamp<uint32_t>(s.sampX, 1, 4), sy = std::clamp<uint32_t>(s.sampY, 1, 4);   // D2747
@@ -924,7 +1114,14 @@ bool Backend::WriteBackRange(uint32_t start, uint32_t size, bool block)
             if (!Overlaps(start, size, rs, r.size)) continue;                                      // D1107
             m.Dirty().Sync(rs, r.size);                                                            // D1108
             if (m.Dirty().Newest(rs, r.size) > r.seq) { r.valid = false; continue; }               // D1109: the CPU overwrote it
-            SetHot(rs);                                       // D1110-1117 (UpdateNative: M2): its next resolves are staged
+            if (!IsHot(rs) && r.sourceKey != ~0u)                                                  // D1110
+            {
+                SetHot(rs);                                                                        // D1112
+                St().resolveDests[r.sourceKey][rs] = true;                                         // D1113
+                m.UpdateNative(r.sourceKey);                                                       // D1114
+            }
+            else if (r.sourceKey != ~0u && !m.nativeColors.count(r.sourceKey)) m.UpdateNative(r.sourceKey);   // D1116: a bake again
+            SetHot(rs);                                                                            // D1117: its next resolves are staged
             Impl::Readback& rb = m.readbacks[rs];
             const auto t0 = std::chrono::steady_clock::now();                                      // D1118
             if (rb.pixels.empty())                                                                 // D1119

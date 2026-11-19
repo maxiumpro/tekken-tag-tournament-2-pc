@@ -226,6 +226,34 @@ struct Backend::Impl {
     // D4749-4791: scatter the small copies that landed. Resolve calls it (D957); D3D11 also calls it at Present
     // (D1265): here FrontTexture does, at its top (core.mm's Present calls FrontTexture).
     void FinishSmallWritebacks();
+
+    // ===== scale / native / shadow (surfaces.mm) — M2c parte 2 =====
+    // Render scale (D3869-3973, D4123-4157). `scale` (core section) starts at 1 (D3869; Initialize no longer reads
+    // TTT2_RENDER_SCALE) and only UpdateScale changes it, through Rescale, which logs
+    // "[gpu-hw] render scale A -> B (...)" byte-compatible with D4155 (bench/analizar_ab.py splits runs on it).
+    // UpdateScale runs where D3D11 runs it: Draw (D380), DrawGpuVs (D520), Resolve (D956), Present (D1264).
+    // RequestedScale (D3937-3958): TTT2_RENDER_SCALE_FILE (re-read every 1 s, [0.5, 4]), else TTT2_RENDER_SCALE
+    // ([1, 4]), else display_settings::GetResolution() / 1280x720 ([0.5, 4]).
+    uint32_t scaleGeneration = ~0u;                                // D3870
+    std::chrono::steady_clock::time_point nextScalePoll{};         // D3871
+    void UpdateScale();                                            // D3960-3973 (Apple: polled every 1 s)
+    // D4123-4157: every colour / depth surface (at 1 if native) and every resolve texture at the old scale is
+    // resampled to `s` on frameCmd (EndPass first); lastFront = nil, the resolve pool is emptied, the resolves'
+    // Readback::generation moves (D4178: pending small copies of the old texture are dropped).
+    void Rescale(float s);
+    // Native-size bake surfaces (D3877-3935): EDRAM base -> the bake's sample pitch. A colour surface the CPU reads
+    // back as a square power-of-two resolve (>= 256, surface <= 1024x1024) and the depth drawn with it render at
+    // scale 1. Draw (draw.mm, D784-813) reads and reverts these maps; UpdateNative only flips them (the next Grow
+    // resamples). TTT2_NATIVE_READBACK=0 disables, TTT2_NATIVE_SCENE_FIX=0 skips the revert.
+    std::unordered_map<uint32_t, uint32_t> nativeColors, nativeDepths;   // D3886
+    std::unordered_map<uint32_t, uint32_t> depthWithColor;               // D3885: colour key -> depth base drawn with it
+    void UpdateNative(uint32_t key);                                     // D3894-3935
+    // Shadow-map skipping with SHADOWS OFF (D2201-2244): square 512 / 1024 / 2048 depth resolves name the map.
+    struct ShadowSurface { uint32_t base = 0, size = 0; uint64_t seen = 0; };   // D2209
+    ShadowSurface shadowSurfaces[4];                                     // D2210
+    void NoteShadowResolve(uint32_t depthBase, uint32_t pitch, uint32_t height);   // D2211-2227
+    bool ShadowMapOff(uint32_t depthBase, uint32_t pitch, uint32_t height) const;  // D2230-2236
+    bool ShadowCaster(const DrawState& st) const;                        // D2237-2244: true = skip (stats.shadowSkips)
 };
 
 // Test hook (core): lets a harness without the game show a texture through the real present path.

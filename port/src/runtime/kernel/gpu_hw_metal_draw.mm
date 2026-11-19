@@ -11,14 +11,14 @@
 // D3994, D4015, D4038-4045) using its own passes on Cmd() after EndPass(). So no "clear on load" flag crosses
 // the contract; a pass opened by Draw never clears anything.
 //
-// Not ported in M1 (each named): ShadowCaster (D381, shadow tracking arrives with Resolve, slice 4),
-// UpdateScale (D380: core fixes the scale at Initialize), RasterPool (D413-418: vertices convert serially),
-// IndexUploadCache bookkeeping (D444), native-size surfaces (D784-813: sc = render scale), texture-state /
-// texture-spec / no-discard variants (D695-756: generic shader only, M3), HW toggles / overrides / dumps
-// (D713-723, D825-837, D850), stats (stats_.*).
+// M2c parte 2: UpdateScale (D380, D520), ShadowCaster (D381, D530) and the native-size surfaces (D784-813) are
+// ported (impl.h "scale / native / shadow"; the tracking lives in surfaces.mm).
+// Not ported (each named): RasterPool (D413-418: vertices convert serially), IndexUploadCache bookkeeping (D444),
+// texture-state / texture-spec / no-discard variants (D695-756: generic shader only, M3), HW toggles / overrides /
+// dumps (D713-723, D825-837, D850), CensusTarget / CensusSurfaceUse (D384, D773: diagnostics).
 //
-// DrawGpuVs (M2b) ports D515-666. Not ported (each named): UpdateScale (D520, as Draw), CensusVertex (D526),
-// toggle_ & 2 (D529), ShadowCaster (D530, as Draw), GpuNoteMemory / VcacheStat (D544-550: diagnostics; textures
+// DrawGpuVs (M2b) ports D515-666. Not ported (each named): CensusVertex (D526),
+// toggle_ & 2 (D529), GpuNoteMemory / VcacheStat (D544-550: diagnostics; textures
 // skips them too), the vertex-data ring and its fences / NO_OVERWRITE / VertexUploadCache reuse (D555-583: the
 // per-command-buffer arena replaces every ring, so each draw packs its own data), the "upload only when changed"
 // VS constants (D601-606: the arena is per draw), the IndexUploadCache (D622-639, indexIdentity unused).
@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -215,8 +216,34 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
         needW = std::max({ needW, color.extW, depth->extW });                                            // D781
         needH = std::max({ needH, color.extH, depth->extH });                                            // D782
     }
-    // D784-811 native-size surfaces: not in M1 (needs Resolve's readback tracking), always the render scale.
-    const float sc = m.scale;                                                                            // D810
+    // D784-811 native-size pair (a CPU-read bake surface and its depth, surfaces.mm UpdateNative) or the render scale.
+    // The game reuses EDRAM ranges: a draw into a bake's colour or depth base at another sample pitch than the bake's,
+    // or bigger than a bake (1024x1024), is something else drawn there - back to the render scale for good
+    // (UpdateNative flags it again at the next bake).
+    bool native = (st.writeMask && m.nativeColors.count(st.colorBase)) || (depth && m.nativeDepths.count(st.depthBase));   // D789
+    static const bool sceneFix = [] { const char* e = std::getenv("TTT2_NATIVE_SCENE_FIX"); return !(e && *e == '0'); }();   // D790
+    const uint32_t samplePitch = st.pitch * st.sampX;                                                    // D791
+    const auto nc = st.writeMask ? m.nativeColors.find(st.colorBase) : m.nativeColors.end();             // D792
+    const auto nd = depth ? m.nativeDepths.find(st.depthBase) : m.nativeDepths.end();                    // D793
+    const bool otherUse = (nc != m.nativeColors.end() && nc->second != samplePitch) ||
+                          (nd != m.nativeDepths.end() && nd->second != samplePitch);                     // D794
+    if (native && (otherUse || needW > 1024 || needH > 1024))                                            // D795
+    {
+        static int logged = 0;                                                                           // D797-800
+        if (logged++ < 32)
+            std::fprintf(stderr, "[gpu-hw] native-size surface %05X / depth %03X drawn at sample pitch %u, %ux%u samples%s\n",
+                         st.colorBase, depth ? st.depthBase : 0xFFFu, samplePitch, needW, needH, sceneFix ? ": back to the render scale" : "");
+        if (sceneFix)                                                                                    // D801
+        {
+            m.nativeColors.erase(st.colorBase);                                                          // D803
+            if (depth) m.nativeDepths.erase(st.depthBase);                                               // D804
+            const auto d = m.depthWithColor.find(st.colorBase);                                          // D805
+            if (d != m.depthWithColor.end()) m.nativeDepths.erase(d->second);                            // D806
+            native = false;                                                                              // D807
+        }
+    }
+    const float sc = native ? 1.0f : m.scale;                                                            // D810
+    if (st.writeMask && depth) m.depthWithColor[st.colorBase] = st.depthBase;                            // D811
     if (st.writeMask) m.Grow(color, st.colorBase, needW, needH, sc);                                     // D812
     if (depth) m.Grow(*depth, st.depthBase, needW, needH, sc);                                           // D813
     id<MTLTexture> colorTex = st.writeMask ? color.tex : nil;                                            // D814 (re-read after Grow)
@@ -429,7 +456,8 @@ bool Backend::Draw(const uint32_t* regs, const std::vector<uint32_t>& psCode,
     @autoreleasepool {
         Impl& m = *impl_;
         m.Initialize();                                                                                  // D379
-        // D380 UpdateScale, D381 ShadowCaster: not in M1 (header comment), so shadowSkips stays 0.
+        m.UpdateScale();                                                                                 // D380
+        if (m.ShadowCaster(st)) { ++m.stats.shadowSkips; return true; }                                  // D381
         ++m.stats.draws;                                                                                 // D382
         MtlColorSurface& color = m.Color(st.colorBase);                                                  // D383
         color.touched = true;                                                                            // D385
@@ -495,7 +523,7 @@ GpuVsResult Backend::DrawGpuVs(const uint32_t* regs, const std::vector<uint32_t>
         Impl& m = *impl_;
         auto& vs = static_cast<Impl::Vs&>(shader);                                                       // D518
         m.Initialize();                                                                                  // D519
-        // D520 UpdateScale: not ported (as Draw, D380).
+        m.UpdateScale();                                                                                 // D520
         VsFetchPlan fetchPlan;                                                                           // D521
         m.FetchRanges(vs, minIndex, maxIndex, fetchPlan.lo, fetchPlan.hi, fetchPlan.used);              // D522-523
         if (!fetchPlan.Validate((16u << 20) / 4))                                                        // D524
@@ -503,7 +531,8 @@ GpuVsResult Backend::DrawGpuVs(const uint32_t* regs, const std::vector<uint32_t>
         // D526 CensusVertex: diagnostics, not ported.
         const uint64_t totalDwords = fetchPlan.totalDwords;                                              // D527
         if (totalDwords * 4 + 64 > VdataRingBytes || indices.size() * 4 > IndexRingBytes) return GpuVsResult::Fallback;   // D528
-        // D529 toggle_ & 2, D530 ShadowCaster: not ported (as Draw, D381), so shadowSkips stays 0.
+        // D529 toggle_ & 2: a diagnostic, not ported.
+        if (m.ShadowCaster(st)) { ++m.stats.shadowSkips; return GpuVsResult::Drawn; }                    // D530
 
         ++m.stats.draws;                                                                                 // D532
         ++m.stats.gpuVsDraws;                                                                            // D533

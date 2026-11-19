@@ -4,7 +4,7 @@
 //
 // External symbols this file needs (the core harness m1/core_test.mm defines its own copies, so it links
 // without the game): display_settings::GetVSync / GetSharpness / GetAntiAliasing, host_window::SDLHandle,
-// and Backend::Impl::FrontTexture (gpu_hw_metal_surfaces.mm in the game).
+// and Backend::Impl::FrontTexture / UpdateScale (gpu_hw_metal_surfaces.mm in the game).
 
 #include "gpu_hw_metal_impl.h"
 #import <QuartzCore/CATransaction.h>
@@ -354,6 +354,7 @@ bool Backend::Present(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* 
     @autoreleasepool {
         Impl& m = *impl_;
         m.Initialize();                                                          // D1263
+        m.UpdateScale();                                                         // D1264 (surfaces.mm; a Rescale sets lastFront = nil)
         m.EndPass();   // FrontTexture may blit (CPU front buffer); no render encoder may stay open
         ThrowPendingCommandError();
         m.UpdateGamma(gammaRamp, gammaVersion);                                  // D1267
@@ -405,15 +406,13 @@ void Backend::Impl::Initialize()
         c.scale = CorePipeline(dev, lib, @"scale_ps");
         c.resampleLinear = CorePipeline(dev, lib, @"resample_linear");
         c.resamplePoint = CorePipeline(dev, lib, @"resample_point");
-        // D3948: TTT2_RENDER_SCALE, clamped to [1, 4] off Android; slice 1 has no settings-driven scale.
-        if (const char* e = std::getenv("TTT2_RENDER_SCALE"); e && *e)
-            scale = std::clamp(float(std::atof(e)), 1.0f, 4.0f);
-        else
-            scale = 1.0f;
+        // D3869: the render scale starts at 1; the first UpdateScale (surfaces.mm, M2c parte 2) moves it to the
+        // requested one through Rescale and logs "[gpu-hw] render scale 1.00 -> B", as D3D11 (bench/analizar_ab.py).
+        scale = 1.0f;
         queue = q;
         device = dev;                                                            // last: Initialize is done
-        std::fprintf(stderr, "[gpu-metal] active on %s, mode=%s, render scale %.2f\n", dev.name.UTF8String,
-                     RequestedMode() == Mode::Compare ? "compare" : "on", double(scale));
+        std::fprintf(stderr, "[gpu-metal] active on %s, mode=%s (render scale: see the \"render scale\" line)\n",
+                     dev.name.UTF8String, RequestedMode() == Mode::Compare ? "compare" : "on");
     }
 }
 
@@ -633,8 +632,8 @@ bool Backend::Impl::ReadLogical(id<MTLTexture> tex, uint32_t logicalW, uint32_t 
 
 // ================================================================ stats report (D5056-5097, D5033-5053)
 // Same printf formats as gpu_hw_d3d11.h, byte for byte, so bench/analizar*.py read both backends unchanged.
-// Counters Metal has no source for (compiles, shader_warm, pending skips, staged readbacks, gpu_vs_*, ring waits,
-// shadow skips) stay 0 and are still printed. The "pass breaks" line (D5091-5095) is not printed: no parser reads it.
+// Counters Metal has no source for (compiles, shader_warm, pending skips, ring waits) stay 0 and are still printed;
+// shadow skips count since M2c parte 2 (D5078 line). The "pass breaks" line (D5091-5095) is not printed: no parser reads it.
 void Backend::Impl::MaybeReportStats()
 {
     const auto now = std::chrono::steady_clock::now();
