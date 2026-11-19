@@ -147,6 +147,7 @@ struct CoreState {
     id<MTLTexture> logicalRead = nil;                                   // D4892-4899: ReadLogical's 1280x720 target
     id<MTLBuffer> readBuffer = nil;                                     // ReadTexture's staging (shared)
     SDL_Window* viewWindow = nullptr;                                   // the window metalView belongs to
+    bool viewOwned = false;                                             // made here (harness), not by host_window
     bool loggedNoDrawable = false, loggedFxaa = false, loggedCas = false, loggedMetalFx = false;
     // ---- frame cost (D4961-5054 analogue). GPU times of the command buffers of one frame (= one present
     // sequence number) fold into `frames` from the completed handlers (statsMutex); MaybeReportStats moves the
@@ -262,19 +263,33 @@ bool EnsureLayer(Backend::Impl& m)
     CoreState& c = Core();
     if (m.metalView && c.viewWindow != w)
     {
-        SDL_Metal_DestroyView(static_cast<SDL_MetalView>(m.metalView));
+        if (c.viewOwned) SDL_Metal_DestroyView(static_cast<SDL_MetalView>(m.metalView));   // the window's own view stays
         m.metalView = nullptr;
         m.layer = nil;
     }
     if (m.metalView) return true;
-    SDL_MetalView view = SDL_Metal_CreateView(w);
-    if (!view) throw Failure(std::string("metal: SDL_Metal_CreateView: ") + SDL_GetError());
+    // The view comes from host_window_sdl.cpp, made on the main thread (an NSView made here, on the presenting
+    // thread, never reached the screen). Only a harness without that window code makes it here.
+    SDL_MetalView view = static_cast<SDL_MetalView>(
+        SDL_GetPointerProperty(SDL_GetWindowProperties(w), "ttt2.metal_view", nullptr));
+    if (!view)
+    {
+        if (![NSThread isMainThread])
+            throw Failure("metal: no main-thread Metal view on the window (host_window_sdl.cpp makes it)");
+        view = SDL_Metal_CreateView(w);
+        if (!view) throw Failure(std::string("metal: SDL_Metal_CreateView: ") + SDL_GetError());
+        c.viewOwned = true;
+    }
+    else c.viewOwned = false;
     CAMetalLayer* layer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(view);
     if (!layer)
     {
         SDL_Metal_DestroyView(view);
         throw Failure(std::string("metal: SDL_Metal_GetLayer: ") + SDL_GetError());
     }
+    // Layer properties set off the main thread: explicit transaction, so they commit (no run loop on this thread).
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     layer.device = m.device;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;   // D1304
     layer.framebufferOnly = YES;
@@ -282,6 +297,7 @@ bool EnsureLayer(Backend::Impl& m)
     SDL_GetWindowSizeInPixels(w, &pw, &ph);
     if (pw > 0 && ph > 0) layer.drawableSize = CGSizeMake(pw, ph);
     layer.displaySyncEnabled = display_settings::GetVSync() ? YES : NO;
+    [CATransaction commit];
     m.metalView = view;
     m.layer = layer;
     c.viewWindow = w;
@@ -502,9 +518,15 @@ bool Backend::Impl::PresentTexture(id<MTLTexture> source, uint32_t logicalW, uin
         SDL_GetWindowSizeInPixels(w, &pw, &ph);
         if (pw <= 0 || ph <= 0) { Submit(false); return true; }   // minimised / zero-size: nothing shown (as OCCLUDED)
         const CGSize want = CGSizeMake(pw, ph);
-        if (!CGSizeEqualToSize(layer.drawableSize, want)) layer.drawableSize = want;
         const BOOL vsync = display_settings::GetVSync() ? YES : NO;   // D1649
-        if (layer.displaySyncEnabled != vsync) layer.displaySyncEnabled = vsync;
+        if (!CGSizeEqualToSize(layer.drawableSize, want) || layer.displaySyncEnabled != vsync)
+        {
+            [CATransaction begin];                                      // off the main thread: commit explicitly
+            [CATransaction setDisableActions:YES];
+            if (!CGSizeEqualToSize(layer.drawableSize, want)) layer.drawableSize = want;
+            if (layer.displaySyncEnabled != vsync) layer.displaySyncEnabled = vsync;
+            [CATransaction commit];
+        }
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (!drawable)
         {

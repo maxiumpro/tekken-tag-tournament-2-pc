@@ -150,6 +150,17 @@ Window* Open(uint32_t width, uint32_t height)
         if (std::sscanf(at, "%d,%d", &x, &y) == 2) { SDL_SetWindowPosition(handle, x, y); SDL_SyncWindow(handle); }
     }
 #endif
+#if defined(__APPLE__) && defined(TTT2_GPU_HW_METAL)
+    // R4 Metal backend: AppKit views belong to the main thread. SDL_Metal_CreateView adds an NSView without moving
+    // to the main thread, and the backend presents from the command-processor thread, where the view never reached
+    // the screen (black window, frames fine). Make it here, on the main thread; the backend finds it by property.
+    if (flags & SDL_WINDOW_METAL) {
+        if (SDL_MetalView view = SDL_Metal_CreateView(handle))
+            SDL_SetPointerProperty(SDL_GetWindowProperties(handle), "ttt2.metal_view", view);
+        else
+            std::fprintf(stderr, "[window] SDL_Metal_CreateView: %s\n", SDL_GetError());
+    }
+#endif
     Window* window = new (std::nothrow) Window{handle};
     if (!window) {
         SDL_DestroyWindow(handle);
