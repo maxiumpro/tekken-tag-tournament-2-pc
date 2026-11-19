@@ -849,10 +849,97 @@ public:
         }
         context_->PSSetShaderResources(0, 32, srvs);
         context_->PSSetSamplers(0, 16, samplers);
+        if (PsDumpOn() && !(toggle_ & 128)) DumpPsDraw(ps, regs, cb, psRows, srvs, samplers, rtv, vp);
         if (!(toggle_ & 1) && !draw_skip_probe::SuppressIndexedDraw())
             context_->DrawIndexed(indexCount, firstIndex, baseVertex);
         stats_.triangles += triangleCount == UINT32_MAX ? indexCount / 3 : triangleCount;
         MaybeReportStats();
+    }
+
+    // TTT2_DUMP_PS_CONSTS=<dir>, once per pixel shader, at its first draw: <KEY>.cb0.bin (the pixel half of the
+    // constant file, c[256] = 4,096 B; the bound buffer holds its first "rows" rows, all the shader reads),
+    // <KEY>.cb1.bin (PsStateCB as bound, 1,712 B) and <KEY>.json (textures, samplers, render target, viewport).
+    // KEY is the shader's ps_<KEY>.dxbc name. When a variant is bound (D/R/n/T), the same files also go under its
+    // generic shader's key, if that one has none yet: the constants are set before the variant is chosen.
+    void DumpPsDraw(ID3D11PixelShader* ps, const uint32_t* regs, const PsStateCB& cb, uint32_t rows,
+                    ID3D11ShaderResourceView* const* srvs, ID3D11SamplerState* const* samplers,
+                    ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp)
+    {
+        PsDumpName bound{}, base{};
+        {
+            std::lock_guard lock(psDumpMutex_);
+            if (auto it = psDumpNames_.find(ps); it != psDumpNames_.end()) bound = it->second;
+            if (lastPsEntry_)
+                if (auto it = psDumpNames_.find(lastPsEntry_->ps.Get()); it != psDumpNames_.end()) base = it->second;
+        }
+        if ((!bound.key || psDumped_.count(bound.key)) && (!base.key || psDumped_.count(base.key))) return;
+        std::string j;
+        auto add = [&j](const char* fmt, auto... a) { char b[256]; std::snprintf(b, sizeof(b), fmt, a...); j += b; };
+        add("  \"bound_key\": \"%016llX\", \"bound_tag\": \"%s\", \"base_key\": \"%016llX\", \"ucode\": \"%016llX\",\n",
+            (unsigned long long)bound.key, bound.tag, (unsigned long long)base.key, (unsigned long long)lastPsKey_);
+        add("  \"cb\": [{\"slot\": 0, \"bytes\": 4096, \"rows\": %u}, {\"slot\": 1, \"bytes\": %zu}],\n", rows, sizeof(PsStateCB));
+        j += "  \"srv\": [";
+        for (uint32_t slot = 0, n = 0; slot < 32; ++slot)
+        {
+            if (!srvs[slot]) continue;
+            D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+            srvs[slot]->GetDesc(&d);
+            D3D11_TEXTURE2D_DESC t{};
+            ComPtr<ID3D11Resource> res;
+            ComPtr<ID3D11Texture2D> tex;
+            srvs[slot]->GetResource(&res);
+            if (res && SUCCEEDED(res.As(&tex))) tex->GetDesc(&t);
+            const bool array = d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            add("%s\n    {\"slot\": %u, \"format\": %u, \"view_dim\": %u, \"width\": %u, \"height\": %u, \"mips\": %u, \"array\": %u, ",
+                n++ ? "," : "", slot, unsigned(d.Format), unsigned(d.ViewDimension), t.Width, t.Height, t.MipLevels, t.ArraySize);
+            add("\"first_mip\": %u, \"view_mips\": %u}", array ? d.Texture2DArray.MostDetailedMip : d.Texture2D.MostDetailedMip,
+                array ? d.Texture2DArray.MipLevels : d.Texture2D.MipLevels);
+        }
+        j += "],\n  \"sampler\": [";
+        for (uint32_t slot = 0, n = 0; slot < 16; ++slot)
+        {
+            if (!samplers[slot]) continue;
+            D3D11_SAMPLER_DESC s{};
+            samplers[slot]->GetDesc(&s);
+            add("%s\n    {\"slot\": %u, \"filter\": %u, \"address\": [%u, %u, %u], \"mip_lod_bias\": %.9g, \"max_anisotropy\": %u, ",
+                n++ ? "," : "", slot, unsigned(s.Filter), unsigned(s.AddressU), unsigned(s.AddressV), unsigned(s.AddressW),
+                double(s.MipLODBias), s.MaxAnisotropy);
+            add("\"min_lod\": %.9g, \"max_lod\": %.9g}", double(s.MinLOD), double(s.MaxLOD));
+        }
+        j += "],\n";
+        if (rtv)
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC d{};
+            rtv->GetDesc(&d);
+            D3D11_TEXTURE2D_DESC t{};
+            ComPtr<ID3D11Resource> res;
+            ComPtr<ID3D11Texture2D> tex;
+            rtv->GetResource(&res);
+            if (res && SUCCEEDED(res.As(&tex))) tex->GetDesc(&t);
+            add("  \"rt\": {\"format\": %u, \"width\": %u, \"height\": %u},\n", unsigned(d.Format), t.Width, t.Height);
+        }
+        else j += "  \"rt\": null,\n";
+        add("  \"viewport\": [%.9g, %.9g, %.9g, %.9g, %.9g, %.9g]\n}\n", double(vp.TopLeftX), double(vp.TopLeftY),
+            double(vp.Width), double(vp.Height), double(vp.MinDepth), double(vp.MaxDepth));
+
+        static const bool made = [] { std::error_code ec; std::filesystem::create_directories(PsDumpDir(), ec); return true; }();
+        (void)made;
+        auto write = [](const std::string& path, const void* data, size_t size) {
+            if (FILE* f = std::fopen(path.c_str(), "wb")) { std::fwrite(data, 1, size, f); std::fclose(f); }
+        };
+        for (const PsDumpName* k : { &bound, &base })
+        {
+            if (!k->key || !psDumped_.insert(k->key).second) continue;
+            char name[32];
+            std::snprintf(name, sizeof(name), "/%016llX", (unsigned long long)k->key);
+            const std::string p = std::string(PsDumpDir()) + name;
+            const std::string head = std::string("{\n  \"key\": \"") + (name + 1) + "\", \"tag\": \"" + k->tag + "\",\n";
+            write(p + ".cb0.bin", regs + 0x4000 + 256 * 4, 4096);
+            write(p + ".cb1.bin", &cb, sizeof(cb));
+            write(p + ".json", (head + j).data(), head.size() + j.size());
+        }
+        if ((psDumped_.size() & (psDumped_.size() - 1)) == 0)
+            std::fprintf(stderr, "[gpu-hw] TTT2_DUMP_PS_CONSTS: %zu pixel shaders dumped to %s\n", psDumped_.size(), PsDumpDir());
     }
 
     // ----------------------------------------------------------------- resolve
@@ -2823,6 +2910,14 @@ private:
     std::unordered_map<uint64_t, PsEntry> preparedPs_;
     mutable std::mutex vsTextMutex_;                    // guards vsByText_ (build threads, warm-up)
     mutable std::unordered_map<uint64_t, ComPtr<ID3D11VertexShader>> vsByText_;   // HLSL text key -> compiled
+    // TTT2_DUMP_PS_CONSTS=<dir> (M0 shader duel, diagnostics): at the first draw of each pixel shader, its
+    // constant buffers and a JSON of the draw's textures, samplers, render target and viewport (DumpPsDraw).
+    struct PsDumpName { uint64_t key; char tag[3]; };
+    static const char* PsDumpDir() { static const char* d = [] { const char* e = std::getenv("TTT2_DUMP_PS_CONSTS"); return e && *e ? e : nullptr; }(); return d; }
+    static bool PsDumpOn() { static const bool on = PsDumpDir() != nullptr; return on; }
+    mutable std::mutex psDumpMutex_;                    // guards psDumpNames_ (build threads)
+    mutable std::unordered_map<const void*, PsDumpName> psDumpNames_;   // shader object -> its HLSL text key
+    std::unordered_set<uint64_t> psDumped_;
     double buildBudgetMs_ =
 #if defined(__ANDROID__)
         0;                                             // do not wait for shader builds during Android frames
@@ -3296,8 +3391,18 @@ private:
         e.slots = t.textureSlots; e.cubeSlots = t.cubeSlots; e.constantRows = t.constantRows;
         e.noDiscard = HasNoDiscardVariant(t);
         if (!alphaTest && !e.noDiscard) { why = "no no-discard variant"; return BuildResult::Untranslatable; }
-        return CreateFromHlsl(PixelShaderHlsl(t, variant, alphaTest), false, inGame, n, why,
+        const std::string hlsl = PixelShaderHlsl(t, variant, alphaTest);
+        const BuildResult r = CreateFromHlsl(hlsl, false, inGame, n, why,
                               [&](const void* p, size_t size) { return device_->CreatePixelShader(p, size, nullptr, &e.ps); }, cacheOnly);
+        if (r == BuildResult::Ready && PsDumpOn())
+        {
+            // TTT2_DUMP_PS_CONSTS: the shader's ps_<KEY>.dxbc key and its keys.tsv variant letter
+            // (G generic, D depth, R resolved colour, T texture state; n = without the alpha test).
+            const char v = spec ? 'T' : variant == TextureStateVariant::Generic ? 'G' : variant == TextureStateVariant::Depth ? 'D' : 'R';
+            std::lock_guard lock(psDumpMutex_);
+            psDumpNames_[e.ps.Get()] = { Fnv(hlsl.data(), hlsl.size()), { v, alphaTest ? '\0' : 'n', '\0' } };
+        }
+        return r;
     }
 
     // A shader first met in game (not in the corpus yet) stalls the frame that needs it, and an
