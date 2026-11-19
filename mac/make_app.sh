@@ -67,6 +67,18 @@ cp "$binary" "$contents/MacOS/$exe_name"
 chmod 755 "$contents/MacOS/$exe_name"
 cp "$moltenvk" "$contents/Frameworks/libMoltenVK.dylib"
 chmod 644 "$contents/Frameworks/libMoltenVK.dylib"
+# SDL3 dlopens "libusb-1.0.dylib" to read wired Xbox One/Series (GIP) pads that macOS has no driver for, e.g. the
+# Hyperkin Xenon 2e24:072c; without it SDL sees no pad. Bundled when a build for this slice is found (LIBUSB_DYLIB,
+# else Homebrew's); the step below gives it an @rpath name and checks it points nowhere outside the bundle.
+# Homebrew's is built for the running macOS (minos 27.0 here) and raises the app's floor to it: for --release,
+# point LIBUSB_DYLIB at a libusb built for the deployment target (arm64 14.4, x86_64 13.0).
+local libusb=${LIBUSB_DYLIB:-/opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib}
+if [[ -f $libusb ]] && [[ " $(lipo -archs "$libusb") " == *" $(lipo -archs "$binary" | cut -d' ' -f1) "* ]]; then
+    cp -L "$libusb" "$contents/Frameworks/libusb-1.0.dylib"
+    chmod 644 "$contents/Frameworks/libusb-1.0.dylib"
+else
+    echo "note: no libusb for this slice; wired Xbox One/Series pads will not be seen" >&2
+fi
 
 # Bundle the dylibs, rewrite install names and rpaths, write the ICD manifest, Info.plist and icon.
 python3 -I - "$contents" "$exe_name" "$binary" "$moltenvk_icd" "$repo" <<'PY'
@@ -243,6 +255,11 @@ else
         else lipo -create "$work/arm64.app/$rel" "$slice" -output "$app/$rel"
         fi
     done
+    # libusb is optional: one slice only (e.g. Homebrew's arm64 build) means no wired Xbox pads, not a broken app.
+    u="$app/Contents/Frameworks/libusb-1.0.dylib"
+    if [[ -f $u && ! ( " $(lipo -archs "$u") " == *" arm64 "* && " $(lipo -archs "$u") " == *" x86_64 "* ) ]]; then
+        echo "note: libusb is not universal (LIBUSB_DYLIB); left out" >&2; rm -f "$u"
+    fi
     (cd "$app" && for f in "Contents/MacOS/$exe_name" Contents/Frameworks/*.dylib; do
         [[ " $(lipo -archs "$f") " == *" arm64 "* && " $(lipo -archs "$f") " == *" x86_64 "* ]] ||
             { echo "$f is not universal" >&2; exit 1; }
