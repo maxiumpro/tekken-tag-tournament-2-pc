@@ -1,6 +1,8 @@
 // R4 Metal backend, shaders (gpu_hw_metal_impl.h "shaders" section, M1 slice 2): the pixel-shader cache
 // (microcode -> generic HLSL text key -> airconv ps_<KEY>.metallib + ps_<KEY>.layout.tsv), the fixed CPU-vertex
-// vertex shader, render pipelines and depth/stencil states.
+// vertex shader, render pipelines and depth/stencil states. M2b: the converted vertex shaders (microcode -> VS HLSL
+// text key -> vg_<KEY>.metallib + vg_<KEY>.layout.tsv, same directory), Backend::VertexShader (TTT2_GPU_VS gate,
+// D325) and their pipelines (gpu_hw_metal_impl.h "vertex shaders" section).
 // Every line ported from gpu_hw_d3d11.h carries a "// D<line>" marker (the D3D11 backend stays the reference).
 //
 // No shader is compiled from HLSL here: the metallib cache is converted offline (m1/convertir_cache.sh); a key
@@ -201,10 +203,19 @@ struct ShaderState {
     id<MTLFunction> vs[17] = {};                                 // D2111: one per interpolator count 0..16
     std::map<std::array<uint64_t, 3>, id<MTLRenderPipelineState>> pipelines;
     std::unordered_map<uint64_t, id<MTLDepthStencilState>> depthStates;   // D2905-ish depthStates_
+    // M2b vertex shaders: D2908 vertexShaders_ (key = VsKey(microcode)), its key memo (D476 vsKeys_), D2912
+    // vsByText_ (text key -> the loaded function and its tables; a miss or a load failure is remembered too).
+    struct VsText { id<MTLFunction> fn = nil; std::vector<Impl::ArgField> args; uint32_t argBytes = 0, cbCount = 0; };
+    ShaderKeyCache vsKeys;
+    std::unordered_map<uint64_t, Impl::Vs> gpuVs;                // D2908 vertexShaders_
+    std::unordered_map<uint64_t, VsText> vsByText;
+    uint64_t vsCacheMisses = 0;                                  // distinct VS text keys missing from the cache
+    std::map<std::array<uint64_t, 4>, id<MTLRenderPipelineState>> vsPipelines;
 };
 ShaderState& S() { static ShaderState* s = new ShaderState; return *s; }   // leaked with the Backend (D5140)
 
 uint64_t PsKey(const std::vector<uint32_t>& code) { return Fnv(code.data(), code.size() * 4, 0xC0FFEEull + code.size()); }   // D3341
+uint64_t VsKey(const std::vector<uint32_t>& code) { return Fnv(code.data(), code.size() * 4, 0x5EEDull + code.size()); }     // D3340
 
 std::string Describe(NSError* e)
 {
@@ -283,12 +294,16 @@ bool ReadLayout(const std::filesystem::path& path, std::vector<LayoutRow>& rows,
     return !rows.empty();
 }
 
-// Fills e.fn / e.args / e.argBytes / e.cbCount from <dir>/ps_<KEY>.metallib + .layout.tsv. False + why on failure;
-// missing = the files are not there (a cache miss, not an error).
-bool LoadMetallib(id<MTLDevice> device, const std::filesystem::path& dir, Impl::Ps& e, bool& missing, std::string& why)
+// One converted shader <dir>/<prefix>_<KEY>.metallib + .layout.tsv (prefix ps or vg; the layouts of both stages
+// share the format and the cbuffer rule below). False + why on failure; missing = the files are not there (a cache
+// miss, not an error).
+struct Loaded { id<MTLFunction> fn = nil; std::vector<Impl::ArgField> args; uint32_t argBytes = 0, cbCount = 0; };
+
+bool LoadLibraryFiles(id<MTLDevice> device, const std::filesystem::path& dir, const char* prefix, uint64_t textKey,
+                      Loaded& e, bool& missing, std::string& why)
 {
     missing = false;
-    const std::string base = "ps_" + Hex16(e.textKey);
+    const std::string base = std::string(prefix) + "_" + Hex16(textKey);
     const std::filesystem::path lib = dir / (base + ".metallib"), layout = dir / (base + ".layout.tsv");
     std::error_code ec;
     if (dir.empty() || !std::filesystem::exists(lib, ec) || !std::filesystem::exists(layout, ec)) { missing = true; return false; }
@@ -340,6 +355,43 @@ bool LoadMetallib(id<MTLDevice> device, const std::filesystem::path& dir, Impl::
     e.args = std::move(args);
     e.argBytes = bytes;
     e.cbCount = uint32_t(cbs.size());
+    return true;
+}
+
+// Fills e.fn / e.args / e.argBytes / e.cbCount from <dir>/ps_<KEY>.metallib + .layout.tsv.
+bool LoadMetallib(id<MTLDevice> device, const std::filesystem::path& dir, Impl::Ps& e, bool& missing, std::string& why)
+{
+    Loaded l;
+    if (!LoadLibraryFiles(device, dir, "ps", e.textKey, l, missing, why)) return false;
+    e.fn = l.fn;
+    e.args = std::move(l.args);
+    e.argBytes = l.argBytes;
+    e.cbCount = l.cbCount;
+    return true;
+}
+
+// M2b: <dir>/vg_<KEY>.metallib + .layout.tsv. Besides the shared checks, the binding table must be exactly what
+// DrawGpuVs fills: t0 (uint, 8 B gpuAddress) @0 and meta_t0 (ulong, byte length) @8, 16 B (BINDINGS.md "SRV buffer";
+// the 709 converted VS of the game cache all have it), and the function must be a vertex function.
+bool LoadVsMetallib(id<MTLDevice> device, const std::filesystem::path& dir, uint64_t textKey, ShaderState::VsText& e,
+                    bool& missing, std::string& why)
+{
+    Loaded l;
+    if (!LoadLibraryFiles(device, dir, "vg", textKey, l, missing, why)) return false;
+    const bool tables = l.args.size() == 2 && l.args[0].name == "t0" && l.args[0].offset == 0 &&
+                        l.args[1].name == "meta_t0" && l.args[1].offset == 8 && l.argBytes == 16;
+    if (!tables)
+    {
+        why = "binding_table is not {t0@0, meta_t0@8} (16 B):";
+        for (const Impl::ArgField& a : l.args) why += " " + a.type + " " + a.name + "@" + std::to_string(a.offset);
+        why += ", " + std::to_string(l.argBytes) + " B";
+        return false;
+    }
+    if (l.fn.functionType != MTLFunctionTypeVertex) { why = "shader_main is not a vertex function"; return false; }
+    e.fn = l.fn;
+    e.args = std::move(l.args);
+    e.argBytes = l.argBytes;
+    e.cbCount = l.cbCount;
     return true;
 }
 
@@ -429,7 +481,62 @@ MTLBlendOperation BlendOp(uint32_t o)                                           
     }
 }
 
+// D4218-4229 the blend part of a pipeline key: blend word (0 when passthrough or no colour) | write mask << 8.
+uint64_t BlendKey(MTLPixelFormat color, uint32_t blend, uint32_t writeMask)
+{
+    const uint32_t b = blend;                                                                            // D4218
+    const uint32_t srcF = b & 0x1F, op = (b >> 5) & 7, dstF = (b >> 8) & 0x1F;                          // D4219
+    const uint32_t srcFA = (b >> 16) & 0x1F, opA = (b >> 21) & 7, dstFA = (b >> 24) & 0x1F;             // D4220
+    const bool passthrough = srcF == 1 && dstF == 0 && srcFA == 1 && dstFA == 0 && op == 0 && opA == 0;  // D4221
+    const bool hasColor = color != MTLPixelFormatInvalid;
+    return (uint64_t(passthrough || !hasColor ? 0 : b) << 32) | (uint64_t(hasColor ? writeMask & 15 : 0) << 8);   // D4229
+}
+
+// Colour attachment (blend, write mask) and depth / stencil formats, shared by both vertex paths' pipelines.
+void SetAttachments(MTLRenderPipelineDescriptor* d, MTLPixelFormat color, MTLPixelFormat depth, uint32_t blend, uint32_t writeMask)
+{
+    const uint32_t b = blend;                                                                            // D4218
+    const uint32_t srcF = b & 0x1F, op = (b >> 5) & 7, dstF = (b >> 8) & 0x1F;                          // D4219
+    const uint32_t srcFA = (b >> 16) & 0x1F, opA = (b >> 21) & 7, dstFA = (b >> 24) & 0x1F;             // D4220
+    const bool passthrough = srcF == 1 && dstF == 0 && srcFA == 1 && dstFA == 0 && op == 0 && opA == 0;  // D4221
+    if (color != MTLPixelFormatInvalid)
+    {
+        MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[0];
+        ca.pixelFormat = color;
+        ca.blendingEnabled = passthrough ? NO : YES;                                                     // D4263
+        ca.sourceRGBBlendFactor = BlendFactor(srcF, false);                                              // D4264
+        ca.destinationRGBBlendFactor = BlendFactor(dstF, false);
+        ca.rgbBlendOperation = BlendOp(op);
+        ca.sourceAlphaBlendFactor = BlendFactor(srcFA, true);                                            // D4265
+        ca.destinationAlphaBlendFactor = BlendFactor(dstFA, true);
+        ca.alphaBlendOperation = BlendOp(opA);
+        const uint32_t wm = writeMask & 15;                                                              // D4266: bit0 R .. bit3 A
+        ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
+                       ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
+    }
+    d.depthAttachmentPixelFormat = depth;
+    if (depth == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = depth;
+}
+
 } // namespace
+
+// ================================================================ Backend (public, vertex shader part) - M2b
+VertexShaderHandle* Backend::VertexShader(const std::vector<uint32_t>& code)
+{
+    @autoreleasepool {
+        Impl& m = *impl_;
+        m.Initialize();                                                                                  // D472
+        // D325-328: TTT2_GPU_VS=0 keeps every vertex shader on the CPU.
+        static const bool onGpu = [] { const char* e = std::getenv("TTT2_GPU_VS"); return !e || std::strcmp(e, "0") != 0; }();
+        static const bool logged = [] {
+            std::fprintf(stderr, "[gpu-metal] vertex shaders on the %s\n", onGpu ? "GPU (converted vg_ metallib cache)" : "CPU (TTT2_GPU_VS=0)");
+            return true;
+        }();
+        (void)logged;
+        if (!onGpu || code.empty()) return nullptr;                                                      // D473
+        return m.VertexShaderFor(code);
+    }
+}
 
 // ================================================================ Backend::Impl (shaders section)
 const Backend::Impl::Ps* Backend::Impl::PixelShader(const std::vector<uint32_t>& code)
@@ -477,15 +584,10 @@ id<MTLRenderPipelineState> Backend::Impl::Pipeline(const Ps& ps, uint32_t interp
                                                    uint32_t blend, uint32_t writeMask)
 {
     interps = std::min<uint32_t>(interps, 16);
-    const uint32_t b = blend;                                                                            // D4218
-    const uint32_t srcF = b & 0x1F, op = (b >> 5) & 7, dstF = (b >> 8) & 0x1F;                          // D4219
-    const uint32_t srcFA = (b >> 16) & 0x1F, opA = (b >> 21) & 7, dstFA = (b >> 24) & 0x1F;             // D4220
-    const bool passthrough = srcF == 1 && dstF == 0 && srcFA == 1 && dstFA == 0 && op == 0 && opA == 0;  // D4221
-    const bool hasColor = color != MTLPixelFormatInvalid;
     // D4229 key: blend word (0 when passthrough) | write mask; plus what Metal bakes into the pipeline.
     const std::array<uint64_t, 3> key = {
         ps.textKey,
-        (uint64_t(passthrough || !hasColor ? 0 : b) << 32) | (uint64_t(hasColor ? writeMask & 15 : 0) << 8) | interps,
+        BlendKey(color, blend, writeMask) | interps,
         (uint64_t(color) << 32) | uint64_t(depth) };
     ShaderState& s = S();
     if (auto it = s.pipelines.find(key); it != s.pipelines.end()) return it->second;
@@ -505,23 +607,7 @@ id<MTLRenderPipelineState> Backend::Impl::Pipeline(const Ps& ps, uint32_t interp
         vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
         vd.layouts[0].stepRate = 1;
         d.vertexDescriptor = vd;
-        if (hasColor)
-        {
-            MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[0];
-            ca.pixelFormat = color;
-            ca.blendingEnabled = passthrough ? NO : YES;                                                 // D4263
-            ca.sourceRGBBlendFactor = BlendFactor(srcF, false);                                          // D4264
-            ca.destinationRGBBlendFactor = BlendFactor(dstF, false);
-            ca.rgbBlendOperation = BlendOp(op);
-            ca.sourceAlphaBlendFactor = BlendFactor(srcFA, true);                                        // D4265
-            ca.destinationAlphaBlendFactor = BlendFactor(dstFA, true);
-            ca.alphaBlendOperation = BlendOp(opA);
-            const uint32_t wm = writeMask & 15;                                                          // D4266: bit0 R .. bit3 A
-            ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
-                           ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
-        }
-        d.depthAttachmentPixelFormat = depth;
-        if (depth == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = depth;
+        SetAttachments(d, color, depth, blend, writeMask);                                               // D4263-4266
         NSError* err = nil;
         id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:d error:&err];
         if (!p)
@@ -529,6 +615,86 @@ id<MTLRenderPipelineState> Backend::Impl::Pipeline(const Ps& ps, uint32_t interp
                           ", colour " + std::to_string(long(color)) + ", depth " + std::to_string(long(depth)) + "): " + Describe(err));
         return s.pipelines[key] = p;
     }
+}
+
+// M2b: D450 BindVertexShader(vs.vs) + D643 IASetInputLayout(nullptr): the converted VS reads its vertices through t0,
+// so the pipeline has no vertex descriptor. Keyed on both text keys (one VS text links with one PS text once).
+id<MTLRenderPipelineState> Backend::Impl::Pipeline(const Vs& vs, const Ps& ps, MTLPixelFormat color, MTLPixelFormat depth,
+                                                   uint32_t blend, uint32_t writeMask)
+{
+    if (!vs.fn) throw Failure("metal: GPU-VS pipeline without a vertex function");
+    const std::array<uint64_t, 4> key = {
+        vs.textKey, ps.textKey, BlendKey(color, blend, writeMask), (uint64_t(color) << 32) | uint64_t(depth) };
+    ShaderState& s = S();
+    if (auto it = s.vsPipelines.find(key); it != s.vsPipelines.end()) return it->second;
+    @autoreleasepool {
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = vs.fn;
+        d.fragmentFunction = ps.fn;
+        d.vertexDescriptor = nil;
+        SetAttachments(d, color, depth, blend, writeMask);                                               // D4263-4266
+        NSError* err = nil;
+        id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!p)
+            throw Failure("metal: pipeline for vg_" + Hex16(vs.textKey) + " + ps_" + Hex16(ps.textKey) +
+                          " (colour " + std::to_string(long(color)) + ", depth " + std::to_string(long(depth)) + "): " + Describe(err));
+        return s.vsPipelines[key] = p;
+    }
+}
+
+// D472-500 VertexShader minus the gate, D3350-3367 BuildVertexShader / D3371-3382 SharedVertexShader against the
+// converted cache (nothing is compiled in game: TakePrepared / AwaitBuild / pending builds do not exist here).
+Backend::Impl::Vs* Backend::Impl::VertexShaderFor(const std::vector<uint32_t>& code)
+{
+    ShaderState& s = S();
+    const uint64_t key = s.vsKeys.Get(code, VsKey);                                                      // D476
+    if (auto it = s.gpuVs.find(key); it != s.gpuVs.end()) return it->second.t ? &it->second : nullptr;         // D478 (failed = no translation kept)
+    Vs& e = s.gpuVs[key];
+    statVertexShaders = s.gpuVs.size();                                                                     // D5089 "%zu vs" = vertexShaders_.size()
+    auto t = std::make_shared<VsTranslation>(TranslateVertexShader(code));                               // D3352
+    if (!t->unsupported.empty())                                                                         // D3353
+    {
+        std::fprintf(stderr, "[gpu-metal] vertex shader %016llX (%zu dwords) stays on the CPU: %s\n",
+                     (unsigned long long)key, code.size(), t->unsupported.c_str());                      // D490-493
+        return nullptr;                                                                                  // D494 (failed)
+    }
+    const std::string hlsl = VertexShaderHlsl(*t);                                                       // D3354
+    const uint64_t textKey = Fnv(hlsl.data(), hlsl.size());                                              // D3355 (= vg_<KEY>, D3420)
+    auto [it, fresh] = s.vsByText.try_emplace(textKey);
+    ShaderState::VsText& text = it->second;
+    if (fresh)
+    {
+        bool missing = false;
+        std::string why;
+        if (LoadVsMetallib(device, MetalCacheDirectory(), textKey, text, missing, why))
+            ++stats.diskHits;                                                                            // D3428 (metallib loaded from disk)
+        else if (missing)
+        {
+            ++s.vsCacheMisses;
+            std::fprintf(stderr, "[gpu-metal] vs cache miss %016llX\n", (unsigned long long)textKey);     // once per text key (fresh)
+        }
+        else
+            std::fprintf(stderr, "[gpu-metal] vertex shader %016llX (vg_%016llX) failed to load - it stays on the CPU: %s\n",
+                         (unsigned long long)key, (unsigned long long)textKey, why.c_str());
+    }
+    else if (text.fn) ++stats.warmHits;                                                                  // D481 SharedVertexShader
+    if (!text.fn) return nullptr;                                                                        // D494 (failed: e.t stays null)
+    e.textKey = textKey;
+    e.fn = text.fn;
+    e.args = text.args;
+    e.argBytes = text.argBytes;
+    e.cbCount = text.cbCount;
+    e.constantRows = t->constantRows;                                                                    // D596
+    static_assert(sizeof(Vs::vfDesc) == sizeof(uint32_t) * detail::kMaxVsFetches * 4);
+    VsFetchDescriptors(*t, e.vfDesc);                                                                    // D619 (per translation, once)
+    e.t = std::move(t);
+    return &e;
+}
+
+void Backend::Impl::FetchRanges(const Vs& vs, uint32_t minIndex, uint32_t maxIndex, int64_t lo[96], int64_t hi[96], bool used[96])
+{
+    if (!vs.t) throw Failure("metal: FetchRanges on a vertex shader without a translation");
+    ttt2_hw::VsFetchRanges(*vs.t, minIndex, maxIndex, lo, hi, used);                                     // D522-523
 }
 
 id<MTLDepthStencilState> Backend::Impl::DepthState(const DrawState& st)

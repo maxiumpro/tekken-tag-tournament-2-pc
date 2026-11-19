@@ -22,6 +22,7 @@
 struct SDL_Window;
 
 namespace ttt2_hw { class DirtyTracker; }   // gpu_hw_dirty_tracker.h (needs host_vm: only the game links it)
+namespace ttt2_hw { struct VsTranslation; }  // gpu_hw_translate.h (needs gpu_render.cpp's decoders: only shaders.mm), M2b
 
 namespace ttt2_hw {
 
@@ -155,6 +156,38 @@ struct Backend::Impl {
     // textures calls it for an overlapping non-exact view of resolved bytes (D4525-4535); WriteBackRange uses it
     // in M1 (the async staging of D1100-1190 / D4674-4791 is M2).
     void WriteBack(uint32_t dest, MtlResolved& r);
+
+    // ===== vertex shaders (gpu_hw_metal_shaders.mm) — M2b =====
+    // A converted vertex shader: vg_<KEY>.metallib + vg_<KEY>.layout.tsv in the metallib cache directory (the PS
+    // one), KEY = Fnv(VertexShaderHlsl(TranslateVertexShader(code))) = D3D11's vg_<KEY>.dxbc (D3352-3355, D3417-3424).
+    // Vertex function "shader_main", no stage_in (vertex id only):
+    //   vertex buffer(0) = cbuffer_table: {cb0 @0, cb1 @8} (16 B) or {cb1 @0} (8 B, a shader reading no constant).
+    //     cb0 = XenosVsConstants (the first constantRows rows of regs + 0x4000, c[512]), cb1 = XenosVsState = VsStateCB
+    //     (2256 B). One gpuAddress each.
+    //   vertex buffer(1) = binding_table, 16 B: t0 @0 = gpuAddress of the raw vertex data (host-order dwords,
+    //     PackVertexFetches with baseDword 0: vfRegion counts from t0), meta_t0 @8 = its length in bytes
+    //     (BINDINGS.md "SRV buffer": gpuAddress, byteLength). The data buffer needs useResource (vertex stage).
+    //   Outputs: position + user(reg1_0)..user(reg16_0) = the PS inputs TEXCOORD0..15 (checked in 709/709 metallibs).
+    // One entry per microcode key (VsKey, D3340): each run-time copy has its own fetch parameters; copies with one
+    // HLSL text share one loaded function (D3356-3358 vsByText_). A key missing from the cache logs
+    // "[gpu-metal] vs cache miss <KEY>" once per text key and the shader stays on the CPU (VertexShader -> null).
+    struct Vs : VertexShaderHandle {
+        uint64_t textKey = 0;                        // vg_<KEY>
+        id<MTLFunction> fn = nil;                    // "shader_main" (vertex)
+        std::vector<ArgField> args;                  // binding_table fields in offset order (t0, meta_t0)
+        uint32_t argBytes = 0, cbCount = 0;          // binding_table size; cbuffer_table entries (2 = cb0 cb1, 1 = cb1)
+        uint32_t constantRows = 0;                   // VsTranslation::constantRows (D596)
+        uint32_t vfDesc[32][4] = {};                 // VsFetchDescriptors(t) (D619): depends on the translation only
+        std::shared_ptr<const VsTranslation> t;      // opaque outside shaders.mm
+    };
+    // D472-500 without the TTT2_GPU_VS gate (Backend::VertexShader applies it, D325, D473). Null = CPU vertex stage.
+    Vs* VertexShaderFor(const std::vector<uint32_t>& code);
+    // D522-523 VsFetchRanges(vs.t, minIndex, maxIndex, lo, hi, used).
+    void FetchRanges(const Vs& vs, uint32_t minIndex, uint32_t maxIndex, int64_t lo[96], int64_t hi[96], bool used[96]);
+    // Pipeline with the converted VS instead of the fixed CPU-vertex one (no vertex descriptor); colour / depth /
+    // blend / write mask exactly as Pipeline(ps, interps, ...).
+    id<MTLRenderPipelineState> Pipeline(const Vs& vs, const Ps& ps, MTLPixelFormat color, MTLPixelFormat depth,
+                                        uint32_t blend, uint32_t writeMask);
 };
 
 // Test hook (core): lets a harness without the game show a texture through the real present path.

@@ -1,5 +1,6 @@
 // R4 Metal backend, draw (gpu_hw_metal_impl.h "draw" section, M1 slice 2): Draw (CPU vertex stage),
-// VertexShader / DrawGpuVs (M2: null / Fallback), the shared pixel stage, constant upload, the render encoder.
+// DrawGpuVs (M2b: the converted VS on the GPU), the shared pixel stage, constant upload, the render encoder.
+// Backend::VertexShader lives in gpu_hw_metal_shaders.mm (it needs the translator).
 // Every line ported from gpu_hw_d3d11.h carries a "// D<line>" marker (the D3D11 backend stays the reference).
 //
 // Surfaces (Color / Depth / Grow) and textures (BindTexture / Sampler) are other slices; the slice-2 harness
@@ -15,6 +16,15 @@
 // IndexUploadCache bookkeeping (D444), native-size surfaces (D784-813: sc = render scale), texture-state /
 // texture-spec / no-discard variants (D695-756: generic shader only, M3), HW toggles / overrides / dumps
 // (D713-723, D825-837, D850), stats (stats_.*).
+//
+// DrawGpuVs (M2b) ports D515-666. Not ported (each named): UpdateScale (D520, as Draw), CensusVertex (D526),
+// toggle_ & 2 (D529), ShadowCaster (D530, as Draw), GpuNoteMemory / VcacheStat (D544-550: diagnostics; textures
+// skips them too), the vertex-data ring and its fences / NO_OVERWRITE / VertexUploadCache reuse (D555-583: the
+// per-command-buffer arena replaces every ring, so each draw packs its own data), the "upload only when changed"
+// VS constants (D601-606: the arena is per draw), the IndexUploadCache (D622-639, indexIdentity unused).
+
+// Before the Metal headers (as shaders.mm does with the translator): plain C++, no Apple macro touches its names.
+#include "gpu_hw_vertex_fetch.h"
 
 #include "gpu_hw_metal_impl.h"
 
@@ -30,6 +40,8 @@
 #include <string>
 #include <vector>
 
+extern uint8_t* g_base;   // kernel_shared.h: global guest memory base (declared directly, as surfaces.mm does)
+
 namespace ttt2_hw {
 
 namespace {
@@ -37,6 +49,7 @@ namespace {
 using Impl = Backend::Impl;
 
 constexpr size_t VertexRingBytes = 64u << 20, IndexRingBytes = 16u << 20;   // D2105 (per-draw limits, D398)
+constexpr size_t VdataRingBytes = 64u << 20;                                // D2105 (GPU-VS per-draw limit, D528)
 constexpr size_t kChunkBytes = 8u << 20;      // arena chunk; a bigger request gets a buffer of its own
 constexpr size_t kAlign = 256;                // every allocation (vertex, index, cb, tables) on 256 B
 constexpr size_t kCb0Bytes = 256 * 16;        // D282: c[256]
@@ -108,6 +121,7 @@ uint32_t StencilRef(const DrawState& st) { return st.stencil ? (StencilRefMask(s
 
 uint64_t Rid(MTLResourceID r) { uint64_t u; std::memcpy(&u, &r, 8); return u; }
 uint32_t FloatBits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+float AsFloat(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }                                // D613 AsFloat
 
 // "<prefix><digits>" -> the number, else -1 (airconv field names: sN, cube_sN, meta_sN, tN, meta_tN).
 int Slot(const std::string& name, const char* prefix)
@@ -123,11 +137,28 @@ int Slot(const std::string& name, const char* prefix)
     return v;
 }
 
-// D671-857 PixelStageAndDraw, CPU vertex path (vertex input already uploaded): constants, textures and samplers,
-// output merger, viewport, scissor, rasterizer state, the draw.
+// What feeds the vertex stage (D3D11: what the caller bound before PixelStageAndDraw, D450-456 / D641-661).
+//   Draw (vs == nullptr): vb = the packed clip-space vertices (stage_in, vertex buffer 0, fixed VS for `interps`).
+//   DrawGpuVs: vb = the raw vertex data the converted VS reads as t0 (packed with baseDword 0, so vfRegion counts
+//   dwords from vb's offset and stays valid if vb moves), vbBytes = its length (meta_t0); vsState = its cb1,
+//   vsRows rows of regs + 0x4000 = its cb0. Both are uploaded here, after the BindTexture loop (see below).
+struct VertexInput {
+    Slice vb; size_t vbBytes = 0;
+    uint32_t interps = 0;                       // Draw
+    const Impl::Vs* vs = nullptr;               // DrawGpuVs
+    const VsStateCB* vsState = nullptr;
+    uint32_t vsRows = 0;
+    bool strip = false;                         // D642-643 TRIANGLESTRIP (UINT32_MAX restarts) instead of TRIANGLELIST
+    uint32_t triangles = UINT32_MAX;            // D664 / D855 triangleCount (UINT32_MAX: indexCount / 3)
+};
+
+// D668-857 PixelStageAndDraw, shared tail of both vertex paths (vertex input already uploaded): constants, textures
+// and samplers, output merger, viewport, scissor, rasterizer state, the draw.
 void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlColorSurface& color, const DrawState& st,
-                       Slice vb, size_t vbBytes, uint32_t interps, Slice ib, uint32_t indexCount, float reachX, float reachY)
+                       VertexInput vin, Slice ib, uint32_t indexCount, float reachX, float reachY)
 {
+    Slice& vb = vin.vb;
+    const size_t vbBytes = vin.vbBytes;
     id<MTLCommandBuffer> uploadCmd = m.frameCmd;   // the command buffer whose arena holds vb / ib
     const uint32_t textureSlots = ps.slots, cubeSlots = ps.cubeSlots;                                    // D391 (lastSlots_, lastCubeSlots_)
     // ---- constants and per-draw shader state
@@ -203,21 +234,29 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
     const uint32_t top = std::min(Px(std::max(st.scY0, 0) * int(st.sampY), sc), attH);
     const uint32_t right = std::min(Px(double(x1), sc), attW), bottom = std::min(Px(double(y1), sc), attH);   // D824
     if ((st.cull & 3) == 3) { ++m.stats.emptyDraws; return; }                                            // D828: both faces culled
-    m.stats.triangles += indexCount / 3;                                                                 // D855 (D3D11 counts them from here on, even for an empty scissor)
+    m.stats.triangles += vin.triangles == UINT32_MAX ? indexCount / 3 : vin.triangles;                   // D855 (D3D11 counts them from here on, even for an empty scissor)
     if (right <= left || bottom <= top) return;               // empty scissor: draws nothing (as D3D11), no zero-size rect
 
-    id<MTLRenderPipelineState> pipeline = m.Pipeline(ps, interps, colorTex ? colorTex.pixelFormat : MTLPixelFormatInvalid,
-                                                     depthTex ? depthTex.pixelFormat : MTLPixelFormatInvalid, st.blend, st.writeMask);
+    const MTLPixelFormat colorFormat = colorTex ? colorTex.pixelFormat : MTLPixelFormatInvalid;
+    const MTLPixelFormat depthFormat = depthTex ? depthTex.pixelFormat : MTLPixelFormatInvalid;
+    id<MTLRenderPipelineState> pipeline = vin.vs ? m.Pipeline(*vin.vs, ps, colorFormat, depthFormat, st.blend, st.writeMask)   // D647
+                                                 : m.Pipeline(ps, vin.interps, colorFormat, depthFormat, st.blend, st.writeMask);
     id<MTLDepthStencilState> depthState = m.DepthState(st);                                              // D818
 
     // ---- cb0 (D682-688: the first psRows rows of regs + 0x4000 + 256 * 4) and cb1 (PsStateCB, D757-761) into the
     // frame's arena; their gpuAddress goes to the cbuffer table (BINDINGS.md: {cb0, cb1}, or {cb1} when the
     // shader declares no cb0, checked when the layout was loaded).
-    std::vector<id<MTLBuffer>> used;                                                                     // reached through tables: useResource
-    auto use = [&used](id<MTLBuffer> b) { if (std::find(used.begin(), used.end(), b) == used.end()) used.push_back(b); };
+    // Reached through tables: useResource, ONE call per buffer with every stage that reads it (an arena chunk can hold
+    // vertex and fragment data at once).
+    std::vector<std::pair<id<MTLBuffer>, MTLRenderStages>> used;
+    auto use = [&used](id<MTLBuffer> b, MTLRenderStages stages) {
+        for (auto& u : used)
+            if (u.first == b) { u.second |= stages; return; }
+        used.push_back({ b, stages });
+    };
     Slice cb1 = Alloc(m, sizeof(PsStateCB));
     std::memcpy(cb1.ptr, &cb, sizeof(cb));
-    use(cb1.buf);
+    use(cb1.buf, MTLRenderStageFragment);
     Slice cbTable = Alloc(m, 8 * size_t(ps.cbCount));
     uint64_t cbAddr[2] = { 0, 0 };
     m.lastCb0.clear();
@@ -226,7 +265,7 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
         Slice cb0 = Alloc(m, kCb0Bytes);
         std::memcpy(cb0.ptr, regs + 0x4000 + 256 * 4, size_t(psRows) * 16);                             // D684-685
         std::memset(cb0.ptr + size_t(psRows) * 16, 0, kCb0Bytes - size_t(psRows) * 16);
-        use(cb0.buf);
+        use(cb0.buf, MTLRenderStageFragment);
         cbAddr[0] = cb0.buf.gpuAddress + cb0.offset;
         cbAddr[1] = cb1.buf.gpuAddress + cb1.offset;
         m.lastCb0.assign(cb0.ptr, cb0.ptr + size_t(psRows) * 16);
@@ -278,6 +317,49 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
         }
     }
 
+    // ---- M2b, the converted VS's tables (gpu_hw_metal_impl.h "vertex shaders"), allocated here, after the frameCmd
+    // check above, so no gpuAddress they hold can point into a recycled arena.
+    //   cb0 (D597-609, XenosVsConstants): the first vsRows rows of regs + 0x4000, vsRows * 16 B (at least 16 B).
+    //   cb1 (D610-620, XenosVsState): VsStateCB, 2256 B.
+    //   cbuffer_table: {cb0, cb1} 16 B or {cb1} 8 B. binding_table 16 B: t0 = vb's gpuAddress, meta_t0 = vbBytes.
+    Slice vsCbTable, vsArgTable;
+    if (vin.vs)
+    {
+        const Impl::Vs& vs = *vin.vs;
+        if (!vin.vsState) throw Failure("metal: GPU-VS draw without its VsStateCB");
+        Slice vsCb1 = Alloc(m, sizeof(VsStateCB));
+        std::memcpy(vsCb1.ptr, vin.vsState, sizeof(VsStateCB));                                          // D620
+        use(vsCb1.buf, MTLRenderStageVertex);
+        uint64_t vsCbAddr[2] = { 0, 0 };
+        if (vs.cbCount == 2)
+        {
+            const size_t cb0Bytes = size_t(vin.vsRows) * 16;
+            Slice vsCb0 = Alloc(m, std::max<size_t>(cb0Bytes, 16));
+            if (cb0Bytes) std::memcpy(vsCb0.ptr, regs + 0x4000, cb0Bytes);                               // D606-607
+            else std::memset(vsCb0.ptr, 0, 16);
+            use(vsCb0.buf, MTLRenderStageVertex);
+            vsCbAddr[0] = vsCb0.buf.gpuAddress + vsCb0.offset;
+            vsCbAddr[1] = vsCb1.buf.gpuAddress + vsCb1.offset;
+        }
+        else if (vs.cbCount == 1) vsCbAddr[0] = vsCb1.buf.gpuAddress + vsCb1.offset;
+        else throw Failure("metal: VS cbuffer table with " + std::to_string(vs.cbCount) + " entries not implemented (M2b)");
+        vsCbTable = Alloc(m, 8 * size_t(vs.cbCount));
+        std::memcpy(vsCbTable.ptr, vsCbAddr, 8 * size_t(vs.cbCount));                                    // D648-659 (VS b0, b1)
+        if (vs.argBytes != 16) throw Failure("metal: VS binding_table of " + std::to_string(vs.argBytes) + " B not implemented (M2b)");
+        vsArgTable = Alloc(m, vs.argBytes);
+        std::memset(vsArgTable.ptr, 0, vs.argBytes);
+        for (const Impl::ArgField& f : vs.args)
+        {
+            uint64_t v = 0;
+            if (f.name == "t0") v = vb.buf.gpuAddress + vb.offset;                                       // D660-661 (VS t0 = vdata)
+            else if (f.name == "meta_t0") v = uint64_t(vbBytes);                                         // BINDINGS.md "SRV buffer": byteLength
+            else throw Failure("metal: VS binding_table field " + f.name + " (" + f.type + ") not implemented (M2b)");
+            if (f.offset + 8 > vs.argBytes) throw Failure("metal: VS binding_table field " + f.name + " past the table");
+            std::memcpy(vsArgTable.ptr + f.offset, &v, 8);
+        }
+        use(vb.buf, MTLRenderStageVertex);
+    }
+
     // ---- the render encoder: one open at a time, reused while the targets stay the same.
     if (!m.renderEnc || m.encColor != colorTex || m.encDepth != depthTex)                                // D816 (BindRenderTargets)
     {
@@ -321,12 +403,19 @@ void PixelStageAndDraw(Impl& m, const uint32_t* regs, const Impl::Ps& ps, MtlCol
     [enc setCullMode:(st.cull & 1) ? MTLCullModeFront : (st.cull & 2) ? MTLCullModeBack : MTLCullModeNone];   // D4281
     [enc setFrontFacingWinding:st.frontIsCW ? MTLWindingClockwise : MTLWindingCounterClockwise];         // D4282
     [enc setDepthClipMode:st.depthClip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];                  // D4286
-    [enc setVertexBuffer:vb.buf offset:vb.offset atIndex:0];                                             // D453 (IASetVertexBuffers)
+    if (vin.vs)
+    {
+        [enc setVertexBuffer:vsCbTable.buf offset:vsCbTable.offset atIndex:0];                           // D648-659 (VS b0, b1)
+        [enc setVertexBuffer:vsArgTable.buf offset:vsArgTable.offset atIndex:1];                         // D660-661 (VS t0)
+    }
+    else [enc setVertexBuffer:vb.buf offset:vb.offset atIndex:0];                                        // D453 (IASetVertexBuffers)
     [enc setFragmentBuffer:cbTable.buf offset:cbTable.offset atIndex:0];                                 // D838-848 (b0, b1)
     if (argTable.buf) [enc setFragmentBuffer:argTable.buf offset:argTable.offset atIndex:1];             // D849-850 (t0..31, s0..15)
-    for (id<MTLBuffer> b : used) [enc useResource:b usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+    for (auto& u : used) [enc useResource:u.first usage:MTLResourceUsageRead stages:u.second];
     for (id<MTLTexture> t : usedTextures) [enc useResource:t usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
-    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt32
+    // D642-643 topology. Metal always restarts a strip at index 0xFFFFFFFF with 32-bit indices (D3D11's strip cut).
+    [enc drawIndexedPrimitives:vin.strip ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle
+                    indexCount:indexCount indexType:MTLIndexTypeUInt32
                    indexBuffer:ib.buf indexBufferOffset:ib.offset];                                      // D853 (DrawIndexed)
 }
 
@@ -382,21 +471,97 @@ bool Backend::Draw(const uint32_t* regs, const std::vector<uint32_t>& psCode,
         const Slice ib = Alloc(m, ibBytes);
         std::memcpy(ib.ptr, slots.data(), ibBytes);                                                      // D445
         // D450-456: fixed VS Passthrough(interps), TRIANGLELIST, R32_UINT - in the pipeline (Impl::Pipeline).
-        PixelStageAndDraw(m, regs, *ps, color, st, vb, vbBytes, interps, ib, uint32_t(slots.size()), reachX, reachY);   // D457
+        VertexInput vin;
+        vin.vb = vb;
+        vin.vbBytes = vbBytes;
+        vin.interps = interps;
+        PixelStageAndDraw(m, regs, *ps, color, st, vin, ib, uint32_t(slots.size()), reachX, reachY);    // D457
         m.MaybeReportStats();                                                                            // D856
         return true;                                                                                     // D458
     }
 }
 
-VertexShaderHandle* Backend::VertexShader(const std::vector<uint32_t>&)
-{
-    return nullptr;   // M1: always the CPU vertex stage (gpu_hw_metal.h); the GPU VS path is M2
-}
+// Backend::VertexShader: gpu_hw_metal_shaders.mm (M2b).
 
-GpuVsResult Backend::DrawGpuVs(const uint32_t*, const std::vector<uint32_t>&, VertexShaderHandle&,
-                               std::span<const uint32_t>, uint32_t, uint32_t, const DrawState&, bool, uint32_t, uint64_t)
+// D513-666 DrawGpuVs. `indices` are a triangle list or a strip with UINT32_MAX restarts; minIndex..maxIndex bound
+// the guest vertex data packed. Fallback = nothing changed (the caller runs the CPU vertex stage).
+GpuVsResult Backend::DrawGpuVs(const uint32_t* regs, const std::vector<uint32_t>& psCode,
+                               VertexShaderHandle& shader,
+                               std::span<const uint32_t> indices, uint32_t minIndex, uint32_t maxIndex, const DrawState& st,
+                               bool triangleStrip, uint32_t stripTriangles, uint64_t indexIdentity)
 {
-    return GpuVsResult::Fallback;   // M2; nothing changed, the caller runs the CPU vertex stage
+    @autoreleasepool {
+        (void)indexIdentity;                                     // D624 IndexUploadCache: not ported (header comment)
+        Impl& m = *impl_;
+        auto& vs = static_cast<Impl::Vs&>(shader);                                                       // D518
+        m.Initialize();                                                                                  // D519
+        // D520 UpdateScale: not ported (as Draw, D380).
+        VsFetchPlan fetchPlan;                                                                           // D521
+        m.FetchRanges(vs, minIndex, maxIndex, fetchPlan.lo, fetchPlan.hi, fetchPlan.used);              // D522-523
+        if (!fetchPlan.Validate((16u << 20) / 4))                                                        // D524
+            return GpuVsResult::Fallback;                                                                // D525
+        // D526 CensusVertex: diagnostics, not ported.
+        const uint64_t totalDwords = fetchPlan.totalDwords;                                              // D527
+        if (totalDwords * 4 + 64 > VdataRingBytes || indices.size() * 4 > IndexRingBytes) return GpuVsResult::Fallback;   // D528
+        // D529 toggle_ & 2, D530 ShadowCaster: not ported (as Draw, D381), so shadowSkips stays 0.
+
+        ++m.stats.draws;                                                                                 // D532
+        ++m.stats.gpuVsDraws;                                                                            // D533
+        MtlColorSurface& color = m.Color(st.colorBase);                                                  // D534
+        color.touched = true;                                                                            // D536
+        color.samplePitch = st.pitch * st.sampX;                                                         // D537
+        if (indices.empty()) { ++m.stats.emptyDraws; return GpuVsResult::Drawn; }                        // D538
+        const Impl::Ps* ps = m.PixelShader(psCode);                                                      // D539
+        if (!ps) { ++m.stats.skippedDraws; return GpuVsResult::Skipped; }                                // D540
+        // D543-551 GpuNoteMemory / VcacheStat: diagnostics, not ported.
+
+        // ---- vertex data (D553-593): packed into the frame's arena, slice-relative (baseDword 0: t0 = the slice),
+        // so vfRegion stays valid if PixelStageAndDraw has to upload the slice again.
+        VsStateCB vst{};                                                                                 // D553
+        Slice vdata = Alloc(m, size_t(totalDwords) * 4);
+        size_t vdataBytes = 0;
+        if (totalDwords)                                                                                 // D554
+        {
+            const uint64_t cursor = PackVertexFetches(fetchPlan, regs, g_base, reinterpret_cast<uint32_t*>(vdata.ptr), 0,
+                                                      vst, nullptr, nullptr);                            // D588 (no VertexUploadCache)
+            if (cursor > totalDwords) throw Failure("metal: PackVertexFetches wrote past its " + std::to_string(totalDwords) + " dwords");
+            vdataBytes = size_t(cursor) * 4;                                                             // D591
+            m.stats.vertexDataBytes += vdataBytes;                                                       // D592
+        }
+
+        // ---- vertex constants and state (D596-620); uploaded by PixelStageAndDraw after its texture loop.
+        const uint32_t vsRows = std::min<uint32_t>(vs.constantRows, 512);                                // D597 (c[512], D287)
+        std::memcpy(vst.boolConsts, regs + 0x4900, sizeof(vst.boolConsts));                              // D610
+        std::memcpy(vst.loopConsts, regs + 0x4908, sizeof(vst.loopConsts));                              // D611
+        vst.vte = regs[0x2206];                                                                          // D612
+        vst.xs = AsFloat(regs[0x210F]); vst.xo = AsFloat(regs[0x2110]);                                  // D613
+        vst.ys = AsFloat(regs[0x2111]); vst.yo = AsFloat(regs[0x2112]);                                  // D614
+        vst.zs = AsFloat(regs[0x2113]); vst.zo = AsFloat(regs[0x2114]);                                  // D615
+        vst.pitch = float(st.pitch);                                                                     // D616
+        vst.rows = float(SurfaceH / st.sampY);                                                           // D617
+        vst.noClip = (regs[0x2204] >> 16) & 1;                                                           // D618
+        static_assert(sizeof(vst.vfDesc) == sizeof(vs.vfDesc));
+        std::memcpy(vst.vfDesc, vs.vfDesc, sizeof(vst.vfDesc));                                          // D619 (VsFetchDescriptors, at load)
+
+        // ---- indices (D622-639): the list / strip verbatim into the frame's arena.
+        const size_t ibBytes = indices.size() * 4;                                                       // D626
+        const Slice ib = Alloc(m, ibBytes);
+        std::memcpy(ib.ptr, indices.data(), ibBytes);                                                    // D634
+
+        // D641-661: no input layout, no vertex buffer, topology, the VS and its b0 / b1 / t0 - in PixelStageAndDraw.
+        VertexInput vin;
+        vin.vb = vdata;
+        vin.vbBytes = vdataBytes;
+        vin.vs = &vs;
+        vin.vsState = &vst;
+        vin.vsRows = vsRows;
+        vin.strip = triangleStrip;                                                                       // D642
+        vin.triangles = triangleStrip ? stripTriangles : uint32_t(indices.size() / 3);                   // D664
+        PixelStageAndDraw(m, regs, *ps, color, st, vin, ib, uint32_t(indices.size()),
+                          std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity());   // D662-663
+        m.MaybeReportStats();                                                                            // D856
+        return GpuVsResult::Drawn;                                                                       // D665
+    }
 }
 
 // ================================================================ Backend::Impl (draw section)
