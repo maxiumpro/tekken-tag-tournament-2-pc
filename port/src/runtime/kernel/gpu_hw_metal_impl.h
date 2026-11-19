@@ -102,8 +102,10 @@ struct Backend::Impl {
 
     // ===== textures (gpu_hw_metal_textures.mm) — slice 3; the slice-2 harness provides its own =====
     struct Bound { id<MTLTexture> tex = nil; uint32_t swizzle = 0x688, mode = 0, width = 1, height = 1;
-                   float scaleX = 1, scaleY = 1; uint32_t slices = 1, levels = 1; uint64_t mip = 0; };   // D2197 (+ MipSampling)
+                   float scaleX = 1, scaleY = 1; uint32_t slices = 1, levels = 1; uint64_t mip = 0;
+                   uint32_t info[4] = {2, 2, 0, 0}; };   // D2197 + MipSampling(ft, levels) (D730) + SamplerInfo(ft) (D709)
     Bound BindTexture(const uint32_t* regs, uint32_t slot, bool array);  // D4443-4569
+    // Bound.info is SamplerInfo(DecodeTexture(regs, slot)) BEFORE the cube clamp; draw applies D711 itself.
     // Sampler for a slot (the slot is only a harness hook; the real one keys on info + mip, D2673-2685).
     // The three airconv fields: sN, cube_sN (D2 clamp variant, BINDINGS.md), meta_sN = LOD-bias float bits.
     struct SamplerSet { id<MTLSamplerState> s = nil, cube = nil; float lodBias = 0; };
